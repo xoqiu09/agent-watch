@@ -1,0 +1,5 @@
+{
+  "timeout_streak": 2,
+  "daily_token_budget": {"alice": 5000, "bob": 3000},
+  "default_daily_token_budget": 4000
+}
