@@ -4,11 +4,14 @@ import argparse
 import json
 import re
 import sys
+from datetime import date
+from decimal import Decimal
 from itertools import count
 from pathlib import Path
 
 from .alerts import new_state, process_records, read_config, read_state, upgrade_state, write_state
 from .logread import Log, read_log
+from .report import daily_comparison, write_report
 from .sample import write_sample
 from .summary import summarize
 
@@ -21,45 +24,86 @@ def _parser() -> argparse.ArgumentParser:
     trace = commands.add_parser("trace", help="retrieve an original call record")
     sample = commands.add_parser("sample", help="generate a synthetic call log")
     export = commands.add_parser("export", help="write a deterministic demo JSON")
+    report = commands.add_parser("report", help="write a Chinese Markdown daily report")
 
-    for command in (summary, alerts, trace, export):
+    for command in (summary, alerts, trace, export, report):
         command.add_argument("--log", type=Path, required=True)
-    for command in (alerts, export):
+    summary.add_argument("--config", type=Path)
+    for command in (alerts, export, report):
         command.add_argument("--config", type=Path, required=True)
     alerts.add_argument("--state", type=Path, required=True)
     trace.add_argument("request_id")
     sample.add_argument("--seed", type=int, required=True)
     sample.add_argument("--out", type=Path, required=True)
     export.add_argument("--out", type=Path, required=True)
+    report.add_argument("--date", type=_report_date, required=True)
+    report.add_argument("--out", type=Path, required=True)
     return parser
 
 
+def _report_date(value: str) -> date:
+    try:
+        day = date.fromisoformat(value)
+        if day.isoformat() == value:
+            return day
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("--date must be YYYY-MM-DD")
+
+
 def _export_aliases(
-    values: set[str], prefix: str, users: set[str], public_pattern: str | None = None,
+    values: set[str], prefix: str, private_values: set[str], public_values: set[str],
 ) -> dict[str, str]:
     aliases = {}
     numbers = count(1)
     for value in sorted(values):
-        if public_pattern is not None and value not in users and re.fullmatch(public_pattern, value):
+        if value in public_values and value not in private_values:
             aliases[value] = value
             continue
         alias = f"{prefix}-{next(numbers)}"
-        while alias in users:
+        while alias in private_values:
             alias = f"{prefix}-{next(numbers)}"
         aliases[value] = alias
     return aliases
 
 
+def _json_dumps(value: object, *, ensure_ascii: bool = True, indent: int | None = None) -> str:
+    # The standard encoder handles strings and other scalars. Decimal needs an exact JSON number.
+    def encode(item: object, depth: int) -> str:
+        if isinstance(item, Decimal):
+            return str(item)
+        if isinstance(item, dict):
+            keys = sorted(item) if indent is not None else item
+            entries = [f"{encode(key, depth + 1)}: {encode(item[key], depth + 1)}" for key in keys]
+            return join(entries, "{", "}", depth)
+        if isinstance(item, list):
+            return join([encode(entry, depth + 1) for entry in item], "[", "]", depth)
+        return json.dumps(item, ensure_ascii=ensure_ascii)
+
+    def join(entries: list[str], opening: str, closing: str, depth: int) -> str:
+        if indent is None or not entries:
+            return opening + ", ".join(entries) + closing
+        padding = " " * (indent * depth)
+        next_line = "\n" + padding + " " * indent
+        return opening + next_line + ("," + next_line).join(entries) + "\n" + padding + closing
+
+    return encode(value, 0)
+
+
 def _write_export(log: Log, log_path: Path, config_path: Path, output: Path) -> None:
     by_id = log.index_requests()
     users = {record.call["user"] for record in log.records}
-    user_aliases = _export_aliases(users, "user", users)
-    model_aliases = _export_aliases(
-        {record.call["model"] for record in log.records}, "model", users, r"model-[ab]",
-    )
-    request_aliases = _export_aliases(set(by_id), "request", users, r"r[0-9]{1,4}")
+    models = {record.call["model"] for record in log.records}
+    requests = set(by_id)
+    public_models = {model for model in models if re.fullmatch(r"model-[ab]", model)}
+    public_requests = {request for request in requests if re.fullmatch(r"r[0-9]{1,4}", request)}
+    private_values = users | (models - public_models) | (requests - public_requests)
+    user_aliases = _export_aliases(users, "user", private_values, set())
+    model_aliases = _export_aliases(models, "model", private_values, public_models)
+    request_aliases = _export_aliases(requests, "request", private_values, public_requests)
 
-    events = process_records(log.records, read_config(config_path), new_state())
+    config = read_config(config_path)
+    events = process_records(log.records, config, new_state())
     for event in events:
         if "user" in event:
             event["user"] = user_aliases[event["user"]]
@@ -76,7 +120,20 @@ def _write_export(log: Log, log_path: Path, config_path: Path, output: Path) -> 
             })
         event["request_ids"] = [request_aliases[request_id] for request_id in event["request_ids"]]
 
-    payload = {"summary": summarize(log, user_aliases, model_aliases), "alerts": events}
+    payload = {
+        "summary": summarize(log, user_aliases, model_aliases, prices=config["prices"]),
+        "alerts": events,
+        "report": None,
+    }
+    if log.records:
+        latest_day = max(record.timestamp.date() for record in log.records)
+        payload["report"], _ = daily_comparison(log.records, latest_day, config["prices"] or {})
+    _check_output(output, log_path, config_path)
+    with output.open("w", encoding="utf-8", newline="\n") as target:
+        print(_json_dumps(payload, indent=2), file=target)
+
+
+def _check_output(output: Path, log_path: Path, config_path: Path) -> None:
     for option, source in (("--log", log_path), ("--config", config_path)):
         try:
             same_file = output.samefile(source)
@@ -84,8 +141,6 @@ def _write_export(log: Log, log_path: Path, config_path: Path, output: Path) -> 
             continue
         if same_file:
             raise ValueError(f"--out must differ from {option}")
-    with output.open("w", encoding="utf-8", newline="\n") as target:
-        print(json.dumps(payload, sort_keys=True, indent=2), file=target)
 
 
 def main() -> int:
@@ -103,7 +158,8 @@ def main() -> int:
                 print(f"line {line_number}: {reason}", file=sys.stderr)
 
         if args.command == "summary":
-            print(json.dumps(summarize(log)))
+            prices = read_config(args.config)["prices"] if args.config is not None else None
+            print(_json_dumps(summarize(log, prices=prices), ensure_ascii=prices is None))
         elif args.command == "alerts":
             log.index_requests()
             config = read_config(args.config)
@@ -122,6 +178,10 @@ def main() -> int:
             return 1
         elif args.command == "export":
             _write_export(log, args.log, args.config, args.out)
+        elif args.command == "report":
+            log.index_requests()
+            _check_output(args.out, args.log, args.config)
+            write_report(log.records, args.date, read_config(args.config), args.out)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
