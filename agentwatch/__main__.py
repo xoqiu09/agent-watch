@@ -1,12 +1,15 @@
 """Command-line entry point for agent-watch."""
 
 import argparse
+import errno
 import json
+import os
 import re
 import stat
 import sys
 from datetime import date
 from decimal import Decimal
+from hashlib import sha256
 from itertools import count
 from pathlib import Path
 
@@ -156,14 +159,54 @@ def _check_output(output: Path, log_path: Path, config_path: Path) -> None:
             raise ValueError(f"--out must differ from {option}")
 
 
+def _alert_lock_path(state: Path) -> Path:
+    lock_path = state.with_name(state.name + ".lock")
+    try:
+        lock_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
+        name_max = os.pathconf(state.parent, "PC_NAME_MAX")
+        digest = sha256(os.fsencode(state.name)).hexdigest()
+        if name_max > 0:
+            digest = digest[:name_max - len("..lock")]
+        return state.with_name(f".{digest}.lock")
+    return lock_path
+
+
 def main() -> int:
     args = _parser().parse_args()
+    state_lock = None
     try:
         if args.command == "sample":
             write_sample(args.out, args.seed)
             return 0
 
         is_alerts = args.command == "alerts"
+        if is_alerts:
+            try:
+                import fcntl
+            except ImportError as exc:
+                raise ValueError("alerts requires Unix file locking (fcntl)") from exc
+
+            # The state file is replaced on save, so lock a separate, stable file.
+            lock_path = _alert_lock_path(args.state)
+            for option, source in (("--log", args.log), ("--config", args.config)):
+                try:
+                    same_file = source.samefile(lock_path)
+                except FileNotFoundError:
+                    same_file = source.resolve() == lock_path.resolve()
+                    if not same_file:
+                        source.stat()  # Reject missing inputs before creating the lock.
+                if same_file:
+                    raise ValueError(f"alerts lock file must differ from {option}")
+            try:
+                state_lock = lock_path.open("a")
+            except PermissionError:
+                state_lock = lock_path.open("r")
+            fcntl.flock(state_lock, fcntl.LOCK_EX)
         state = read_state(args.state) if is_alerts else new_state()
         log = read_log(args.log, defer_partial_tail=is_alerts)
         for line_number, reason in log.bad_lines:
@@ -171,6 +214,7 @@ def main() -> int:
                 print(f"line {line_number}: {reason}", file=sys.stderr)
 
         if args.command == "summary":
+            log.index_requests()
             prices = read_config(args.config)["prices"] if args.config is not None else None
             print(_json_dumps(summarize(log, prices=prices), ensure_ascii=prices is None))
         elif args.command == "alerts":
@@ -202,6 +246,9 @@ def main() -> int:
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if state_lock is not None:
+            state_lock.close()
     return 0
 
 

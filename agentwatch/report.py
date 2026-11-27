@@ -73,8 +73,8 @@ def daily_comparison(
                 flags.append("变慢")
             if _success_rate(previous) - _success_rate(today) > Fraction(1, 20):
                 flags.append("失败变多")
-            if today_cost is not None and previous_cost is not None:
-                if today_cost - previous_cost > abs(previous_cost) * Fraction(1, 2):
+            if today_cost is not None and previous_cost is not None and previous_cost > 0:
+                if today_cost - previous_cost > previous_cost * Fraction(1, 2):
                     flags.append("费用上涨")
 
     report = {
@@ -136,7 +136,7 @@ def write_report(records: list[Record], day: date, config: Config, output: Path)
                   "", "## 当天告警", ""])
     lines.extend(_alert_line(event) for event in alerts)
     if not alerts:
-        lines.append("无告警")
+        lines.append("仅按当天调用重算，未触发告警")
     target = NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
                                 dir=output.parent, delete=False)
     temporary_path = Path(target.name)
