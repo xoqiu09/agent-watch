@@ -1,6 +1,37 @@
 # agent-watch
 
-AI 应用上线后，可以用调用日志看谁在用、用量和费用有多少、响应多快，以及哪些模型在失败。agent-watch 用一份虚构日志演示如何查看这些数据、生成日报、发现连续超时和用量超额，以及从告警追回原始调用。
+当 AI 助手让客户久等或用量超出预算时，客服团队需要尽快发现并定位问题。
+
+- 按用户和模型汇总用量、成功率、响应时间和估算费用。
+- 记录连续超时、恢复和用量超额，凭请求编号查回原始记录。
+- 生成日报，对照前一天，标出响应变慢、成功率下降或估算费用上涨。
+
+## 怎么验证的
+
+本地运行 `python3 -m unittest`，**59 项全部通过**。测试确认连续超时达到门槛才告警，告警后首次成功会记录恢复，每位用户每天首次超过 token 预算时提醒一次。沿用同一状态文件重跑同一份日志，不会重复告警。测试也核对了请求追溯、费用计算和日报比较。
+
+在临时副本里故意让成功后超时计数不清零、超额反复告警、日报刚到门槛就标记变慢。对应测试都失败，恢复规则后通过。
+
+## 快速体验
+
+[在线演示](https://xoqiu.cn/watch-demo/index.html)
+
+克隆后，在 `agent-watch` 的上一级目录运行以下命令。样例里故意放了坏行，程序会提示并继续输出汇总。
+
+```sh
+cd agent-watch
+python3 -m agentwatch summary --log data/sample.jsonl --config config.json
+```
+
+演示使用虚构数据，模型和用户均为模拟对象。Owner 制定需求和验收标准，并指导 AI 编程工具实现。
+
+## English overview
+
+agent-watch is a Python CLI for support teams investigating slow AI responses and token budget overruns.\
+It summarizes usage, latency, and estimated costs and compares them in a daily report.\
+It flags repeated timeouts, recoveries, and token budget overruns and traces alerts to the original calls.\
+All 47 tests passed locally, and deliberate rule changes made the relevant tests fail.\
+The demo uses fictional data, models, and users. The owner set requirements and acceptance criteria and directed AI coding tools to build it.
 
 ## 运行演示
 
@@ -82,7 +113,3 @@ python3 -m unittest -v
 ## 未包含
 
 真实模型定价与账单、真实监控系统接入、真实模型调用、网页和真实通知都在本次范围之外。
-
-## English overview
-
-agent-watch is an offline Python CLI for synthetic AI call logs. It summarizes usage, latency, and fictional costs by user and model. It reports timeout streaks, recoveries, and token budget crossings, traces alerts to their source records, and writes a Chinese Markdown daily report with day-over-day comparisons. It also exports repeatable demo JSON with aliases for private identifiers. The full demo requires Python 3.10+ with Unix file locking (`fcntl`) for `alerts`. It uses only the standard library.
