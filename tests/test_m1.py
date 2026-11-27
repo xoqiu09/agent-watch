@@ -5,11 +5,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from hashlib import sha256
 from io import StringIO
 from pathlib import Path
+from select import select
 from unittest.mock import patch
 
 from agentwatch.__main__ import main
@@ -147,6 +148,139 @@ class TestM1(unittest.TestCase):
         ])
         self.assertEqual(json.loads(self.state.read_text())["processed_lines"], 5)
         self.assertEqual(self.alerts().stdout, "")
+
+    def test_concurrent_alerts_do_not_rewind_state_or_repeat_events(self):
+        import fcntl
+
+        self.write_rows(call(1, "timeout", tokens_in=11))
+        args = ["alerts", "--log", str(self.log), "--config", str(self.config),
+                "--state", str(self.state)]
+        pause_before_save = """
+import sys
+from contextlib import contextmanager
+from agentwatch import __main__ as cli
+
+atomic_output = cli.atomic_output
+
+@contextmanager
+def paused_output(path):
+    print("ready to save", file=sys.stderr, flush=True)
+    sys.stdin.read()
+    with atomic_output(path) as target:
+        yield target
+
+cli.atomic_output = paused_output
+raise SystemExit(cli.main())
+"""
+        flock = fcntl.flock
+        first_output = None
+        second_stdout = StringIO()
+        with subprocess.Popen(
+            [sys.executable, "-c", pause_before_save, *args],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as first:
+            try:
+                self.assertTrue(select([first.stderr], [], [], 10)[0], "first run did not reach save")
+                self.assertEqual(first.stderr.readline(), "ready to save\n")
+                self.write_rows(call(2, "timeout"), append=True)
+
+                def finish_first_if_blocked(file, operation):
+                    nonlocal first_output
+                    try:
+                        flock(file, operation | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        first_output = first.communicate(timeout=10)
+                        flock(file, operation)
+
+                # Let the first run save when the second would have to wait for it.
+                with (
+                    patch.object(fcntl, "flock", finish_first_if_blocked),
+                    patch("sys.argv", ["agentwatch", *args]),
+                    redirect_stdout(second_stdout),
+                ):
+                    self.assertEqual(main(), 0)
+                if first_output is None:
+                    first_output = first.communicate(timeout=10)
+                self.assertEqual(first.returncode, 0, first_output[1])
+            finally:
+                first.kill()
+
+        processed_lines = json.loads(self.state.read_text())["processed_lines"]
+        initial_events = event_ids(events_from(first_output[0] + second_stdout.getvalue()))
+        replay_events = event_ids(events_from(self.alerts().stdout))
+        self.assertEqual((processed_lines, initial_events, replay_events),
+                         (2, [("budget_exceeded", ["r1"]), ("timeout_streak", ["r1", "r2"])], []))
+
+    def test_alerts_does_not_create_a_missing_log_at_the_lock_path(self):
+        self.log = self.state.with_name("state.json.lock")
+
+        result = self.alerts(exit_code=1)
+
+        self.assertIn("alerts lock file must differ from --log", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertFalse(self.log.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_alerts_rejects_a_lock_file_linked_to_the_config(self):
+        self.write_rows(call(1))
+        lock_path = self.state.with_name("state.json.lock")
+        lock_path.hardlink_to(self.config)
+        original_config = self.config.read_bytes()
+
+        result = self.alerts(exit_code=1)
+
+        self.assertIn("alerts lock file must differ from --config", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.config.read_bytes(), original_config)
+        self.assertTrue(lock_path.samefile(self.config))
+        self.assertFalse(self.state.exists())
+
+    def test_alerts_explains_when_unix_file_locking_is_unavailable(self):
+        self.write_rows(call(1))
+        argv = ["agentwatch", "alerts", "--log", str(self.log), "--config", str(self.config),
+                "--state", str(self.state)]
+        stderr = StringIO()
+        with (
+            patch.dict(sys.modules, {"fcntl": None}),
+            patch.object(sys, "argv", argv),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(main(), 1)
+        self.assertEqual(stderr.getvalue(), "error: alerts requires Unix file locking (fcntl)\n")
+        self.assertFalse(self.state.with_name("state.json.lock").exists())
+        self.assertFalse(self.state.exists())
+
+    def test_alerts_reuse_a_read_only_lock(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can open a read-only file for writing")
+        self.write_rows(call(1, tokens_in=11))
+        args = ("--config", self.config, "--state", self.state)
+
+        first = self.cli("alerts", *args, umask=0o222)
+
+        self.assertEqual(event_ids(events_from(first.stdout)), [("budget_exceeded", ["r1"])])
+        lock_path = self.state.with_name("state.json.lock")
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o444)
+        second = self.cli("alerts", *args, umask=0o222)
+        self.assertEqual((second.stdout, second.stderr), ("", ""))
+
+    def test_alerts_reuse_a_lock_for_a_long_state_name(self):
+        name_max = os.pathconf(self.directory, "PC_NAME_MAX")
+        if name_max == -1:
+            self.skipTest("filesystem does not report a filename limit")
+        self.state = self.directory / ("s" * (name_max - 4))
+        self.write_rows(call(1, tokens_in=11))
+        inputs = set(self.directory.iterdir())
+
+        first = self.alerts()
+
+        self.assertEqual(event_ids(events_from(first.stdout)), [("budget_exceeded", ["r1"])])
+        self.assertEqual(json.loads(self.state.read_text())["processed_lines"], 1)
+        new_files = set(self.directory.iterdir()) - inputs
+        self.assertEqual(len(new_files - {self.state}), 1)
+        second = self.alerts()
+        self.assertEqual((second.stdout, second.stderr), ("", ""))
+        self.assertEqual(set(self.directory.iterdir()) - inputs, new_files)
 
     def test_06_summary_percentiles_use_nearest_rank_and_only_successes(self):
         successful = [call(i, latency=i * 10, tokens_in=3, tokens_out=5)
@@ -440,6 +574,30 @@ class TestM1(unittest.TestCase):
         self.assertEqual(len(retried), 8)
         self.assertEqual(len({(kind, tuple(ids)) for kind, ids in event_ids(retried)}), 8)
         self.assertEqual(self.alerts().stdout, "")
+
+    def test_alerts_do_not_emit_when_state_write_fails_after_locking(self):
+        import fcntl
+
+        self.write_rows(call(1, tokens_in=11))
+        argv = ["agentwatch", "alerts", "--log", str(self.log), "--config", str(self.config),
+                "--state", str(self.state)]
+        stdout, stderr = StringIO(), StringIO()
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(fcntl, "flock", wraps=fcntl.flock) as lock,
+            patch("agentwatch.__main__.json.dump",
+                  side_effect=OSError("simulated state write failure")) as write,
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(main(), 1)
+
+        lock.assert_called_once()
+        write.assert_called_once()
+        self.assertEqual(stderr.getvalue(), "error: simulated state write failure\n")
+        self.assertEqual(events_from(stdout.getvalue()), [])
+        self.assertFalse(self.state.exists())
+        self.assertEqual(event_ids(events_from(self.alerts().stdout)), [("budget_exceeded", ["r1"])])
 
     def test_22_export_aliases_cannot_reuse_private_identifiers(self):
         model = "model-1"

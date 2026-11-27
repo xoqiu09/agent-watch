@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agentwatch.__main__ import main
-from tests.test_m1 import call
+from tests.test_m1 import call, event_ids, events_from
 
 
 DAY = "2026-11-28"
@@ -57,6 +57,18 @@ class TestM2(unittest.TestCase):
                  "--date", DAY, "--out", self.output)
         return self.output.read_text(encoding="utf-8")
 
+    def test_summary_rejects_duplicate_request_ids_before_printing_costs(self):
+        row = call(1, tokens_in=1000)
+        self.write_rows(row, row)
+        result = subprocess.run(
+            [sys.executable, "-m", "agentwatch", "summary",
+             "--log", str(self.log), "--config", str(self.config)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("duplicate request_id 'r1' on lines 1 and 2", result.stderr)
+
     def test_cost_is_grouped_and_rounded_only_after_adding_calls(self):
         self.set_prices({
             "model-a": {"in_per_1k": 0.04, "out_per_1k": 0.03},
@@ -89,6 +101,34 @@ class TestM2(unittest.TestCase):
         payload = json.loads(export.read_text(encoding="utf-8"), parse_float=Decimal)
         self.assertEqual(payload["summary"]["by_model"]["model-a"]["cost"], expected)
         self.assertEqual(payload["report"]["metrics"]["cost"], expected)
+
+    def _run_readme_display(self):
+        export = self.directory / "demo.json"
+        self.cli("export", "--log", self.log, "--config", self.config, "--out", export)
+        readme = Path(__file__).resolve().parents[1] / "README.md"
+        snippet = readme.read_text(encoding="utf-8").split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        return subprocess.run(
+            [sys.executable, "-", str(export)], input=snippet, capture_output=True, text=True,
+        )
+
+    def test_readme_display_retains_fourth_decimal_place(self):
+        self.set_prices({"model-a": {"in_per_1k": 1000, "out_per_1k": 0.1}})
+        self.write_rows(second_day(1, tokens_in=1099511627776, tokens_out=1))
+
+        result = self._run_readme_display()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            "model-a 1099511627776.0001", "日报费用 1099511627776.0001",
+        ])
+
+    def test_readme_display_handles_an_empty_export(self):
+        self.log.touch()
+
+        result = self._run_readme_display()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "没有日报\n")
 
     def test_cost_rounds_exact_half_up(self):
         self.set_prices({"model-a": {"in_per_1k": 0.05, "out_per_1k": 0}})
@@ -155,6 +195,14 @@ class TestM2(unittest.TestCase):
                 self.assertEqual(report.count("0.0001 元"), 2)
                 self.assertEqual("费用上涨" in report, flagged)
 
+    def test_report_shows_both_costs_without_flagging_growth_from_zero(self):
+        self.set_prices({"model-a": {"in_per_1k": 1.25, "out_per_1k": 4}})
+        self.write_rows(call(1), second_day(2, tokens_in=1000))
+        report = self.report()
+        self.assertIn(f"| {DAY} | 1 | 100.00% | 100 ms | 1000 | 0 | 1.2500 元 |", report)
+        self.assertIn("| 2026-11-27 | 1 | 100.00% | 100 ms | 0 | 0 | 0.0000 元 |", report)
+        self.assertNotIn("费用上涨", report)
+
     def test_missing_previous_day_does_not_compare_with_an_older_day(self):
         self.write_rows(call(1, ts="2026-11-26T12:00:00+08:00"),
                         second_day(2, latency=500, tokens_out=20))
@@ -186,6 +234,19 @@ class TestM2(unittest.TestCase):
             f"- {DAY}T00:00:06+08:00 model-b 恢复，请求 r6",
         ])
         self.assertEqual(self.cli("alerts", *args), "")
+
+    def test_report_explains_empty_alerts_when_the_live_streak_crosses_midnight(self):
+        self.write_rows(
+            call(1, "timeout", ts="2026-11-27T23:59:59+08:00"),
+            second_day(2, "timeout"), second_day(3),
+        )
+        stdout = self.cli("alerts", "--log", self.log, "--config", self.config,
+                          "--state", self.directory / "state.json")
+        self.assertEqual(event_ids(events_from(stdout)), [
+            ("timeout_streak", ["r1", "r2"]), ("recovered", ["r3"]),
+        ])
+        alert_section = self.report().split("## 当天告警\n\n")[1].strip()
+        self.assertEqual(alert_section, "仅按当天调用重算，未触发告警")
 
     def test_report_replaces_output_links_without_overwriting_state(self):
         self.write_rows(second_day(1))

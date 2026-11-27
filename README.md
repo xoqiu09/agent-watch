@@ -4,7 +4,7 @@ AI 应用上线后，可以用调用日志看谁在用、用量和费用有多�
 
 ## 运行演示
 
-在仓库根目录运行。需要 Python 3.10 或更新版本，只使用标准库，整个演示离线运行。
+在仓库根目录运行。需要 Python 3.10 或更新版本。完整演示中的 `alerts` 需要 Unix 文件锁（`fcntl`）。整个演示只使用标准库，可离线运行。
 
 ```sh
 demo="$(mktemp -d)"
@@ -20,12 +20,17 @@ python3 -m agentwatch export --log "$demo/calls.jsonl" --config config.json --ou
 python3 - "$demo/demo.json" <<'PY'
 import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 
-demo = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+demo = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"), parse_float=Decimal)
 for model, row in demo["summary"]["by_model"].items():
     print(model, row["cost"])
-print(json.dumps(demo["report"], ensure_ascii=False))
+report = demo["report"]
+if report is None:
+    print("没有日报")
+else:
+    print("日报费用", report["metrics"]["cost"])
 PY
 ```
 
@@ -33,9 +38,9 @@ PY
 - `summary` 按用户和模型输出调用数、成功率、超时数、错误数、延迟 p50/p95，以及输入和输出 token 合计。成功率以 0 到 1 的比例表示。延迟只取成功调用，升序排列后按最近秩法取第 `ceil(n × p)` 项，其中 `p` 为 0.50 或 0.95，排名从 1 开始。没有成功调用时，延迟分位数为 `null`。坏行的行号和原因写到标准错误，坏行总数单列。
 - `summary` 传入带 `prices` 的配置后，按用户和模型增加 `cost`。每次调用的费用为 `(输入 token × in_per_1k + 输出 token × out_per_1k) / 1000`，单位为虚构的元，汇总完再四舍五入到 4 位小数。没有价格的模型标为“未定价”并排除在费用合计之外。用户的 `unpriced_models` 列出缺价模型。用户只有缺价调用时，`cost` 也显示“未定价”。省略 `--config` 或使用没有 `prices` 的旧配置时，保留原汇总格式。
 - `alerts` 每次按时间处理新行，同一时间按文件顺序。连续超时按模型独立计算，达到门槛时发一次，成功会清零。已经告警的模型在下一次成功时发一条恢复事件，`error` 不增加也不清零超时数。每天的 token 按每条日志的时区日期和用户累计，严格超过预算才发告警，同一天只发一次。没有单独设置预算的用户使用默认值。
-- `alerts` 每行输出一个 JSON 事件。对同一份只追加的日志和配置复用状态文件，第二次运行无输出。重跑会核对请求 ID，只把新行计入告警，并延续上一次的计数。追加记录的时间不能早于上次处理到的时间，否则以状态码 1 退出并保留原进度。末尾解析失败且没有换行的片段留到下次再读，带换行的坏行照常报告。状态文件用内部标识累计用户用量，用行号保留待关联的请求。
-- `trace` 用告警里的 `request_ids` 逐条查原始日志，保留原来的字段和值及行内空白。找不到时输出原因并以状态码 1 退出。每条调用必须使用唯一的 `request_id`。发现重复时，`alerts`、`trace` 和 `export` 报告冲突 ID 和行号，以状态码 1 退出。
-- `report` 把指定日期的调用数、成功率、p95、输入和输出 token、费用及告警写成中文 Markdown。按日志时间戳的本地日期取当天记录，用同一套告警规则从头计算。告警状态文件不会被读取或修改。报告写完后替换输出路径已有的文件或链接，链接指向的文件保持原样。每条告警占一行，标识中的换行显示为空格。与紧邻的前一天相比，p95 上升超过 30% 显示“变慢”，成功率下降超过 5 个百分点显示“失败变多”，已定价费用上升超过 50% 显示“费用上涨”。比较使用舍入前的值。前一天没有记录时显示“没有前一天的数据”。
+- `alerts` 每行输出一个 JSON 事件。对同一份只追加的日志和配置复用状态文件，第二次运行无输出。并发运行时，通过状态文件旁保留的 `.lock` 文件依次处理和保存进度，需要 Unix 文件锁。重跑会核对请求 ID，只把新行计入告警，并延续上一次的计数。追加记录的时间不能早于上次处理到的时间，否则以状态码 1 退出并保留原进度。末尾解析失败且没有换行的片段留到下次再读，带换行的坏行照常报告。状态文件用内部标识累计用户用量，用行号保留待关联的请求。
+- `trace` 用告警里的 `request_ids` 逐条查原始日志，保留原来的字段和值及行内空白。找不到时输出原因并以状态码 1 退出。每条调用必须使用唯一的 `request_id`。发现重复时，`summary`、`alerts`、`trace`、`report` 和 `export` 报告冲突 ID 和行号，以状态码 1 退出。
+- `report` 把指定日期的调用数、成功率、p95、输入和输出 token、费用及告警写成中文 Markdown。按日志时间戳的本地日期取当天记录，用同一套告警规则从头计算。若一串连续超时跨过午夜，日报只计算当天的超时。告警状态文件不会被读取或修改。报告写完后替换输出路径已有的文件或链接，链接指向的文件保持原样。每条告警占一行，标识中的换行显示为空格。与紧邻的前一天相比，p95 上升超过 30% 显示“变慢”，成功率下降超过 5 个百分点显示“失败变多”。前一天已定价费用大于零且涨幅超过 50% 时，显示“费用上涨”。比较使用舍入前的值。前一天没有记录时显示“没有前一天的数据”。
 - `export` 将汇总和告警写入 `$demo/demo.json`，每条告警的 `records` 包含对应调用的标准字段。汇总使用配置中的价格，`report` 字段包含最新有记录日期的指标及环比，空日志的该字段为 `null`。用户名使用一致的别名，模型名和请求 ID 只保留演示格式（`model-a`、`model-b` 和 `r` 加 1 至 4 位数字），其他值也使用别名。生成别名时会跳过与私密原标识相同的值。导出会去掉绝对路径、主机名和额外日志字段。同样的输入重复导出，文件逐字节一致。输出文件须与日志、配置分别存放，指向同一文件的路径或链接会被拒绝。
 
 ## 验收测试
@@ -80,4 +85,4 @@ python3 -m unittest -v
 
 ## English overview
 
-agent-watch is an offline Python CLI for synthetic AI call logs. It summarizes usage, latency, and fictional costs by user and model. It reports timeout streaks, recoveries, and token budget crossings, traces alerts to their source records, and writes a Chinese Markdown daily report with day-over-day comparisons. It also exports repeatable demo JSON with aliases for private identifiers. Python 3.10+ and the standard library are sufficient.
+agent-watch is an offline Python CLI for synthetic AI call logs. It summarizes usage, latency, and fictional costs by user and model. It reports timeout streaks, recoveries, and token budget crossings, traces alerts to their source records, and writes a Chinese Markdown daily report with day-over-day comparisons. It also exports repeatable demo JSON with aliases for private identifiers. The full demo requires Python 3.10+ with Unix file locking (`fcntl`) for `alerts`. It uses only the standard library.
