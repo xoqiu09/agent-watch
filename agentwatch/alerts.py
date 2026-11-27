@@ -1,15 +1,16 @@
 """Evaluate timeout and token budget rules and persist the log position."""
 
 import json
-from datetime import datetime
+import os
+from contextlib import contextmanager
 from decimal import Decimal
 from fractions import Fraction
 from hashlib import sha256
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import TypedDict
+from tempfile import TemporaryDirectory
+from typing import Iterator, TextIO, TypedDict
 
-from .logread import Record
+from .logread import Record, parse_timestamp
 
 
 class Price(TypedDict):
@@ -35,6 +36,7 @@ class DailyUsage(TypedDict):
 class State(TypedDict):
     processed_lines: int
     last_timestamp: str | None
+    exact_timestamps: bool
     timeouts: dict[str, list[int]]
     daily_usage: dict[str, dict[str, DailyUsage]]
 
@@ -78,25 +80,39 @@ def _parse_prices(raw: object) -> Prices:
 
 
 def new_state() -> State:
-    return State(processed_lines=0, last_timestamp=None, timeouts={}, daily_usage={})
+    return State(processed_lines=0, last_timestamp=None, exact_timestamps=True, timeouts={}, daily_usage={})
 
 
 def read_state(path: Path) -> State:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        state = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return new_state()
+    if not isinstance(state, dict):
+        raise ValueError(f"state file {path} must contain a JSON object")
+    if "processed_lines" not in state:
+        raise ValueError(f"state file {path}: missing processed_lines")
+    processed_lines = state["processed_lines"]
+    if type(processed_lines) is not int or processed_lines < 0:
+        raise ValueError(f"state file {path}: processed_lines must be a non-negative integer")
+    return state
 
 
-def write_state(path: Path, state: State) -> None:
-    target = NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
-    temporary_path = Path(target.name)
-    try:
-        with target:
-            json.dump(state, target)
+@contextmanager
+def atomic_output(
+    path: Path, *, creation_mode: int = 0o600, final_mode: int | None = None,
+) -> Iterator[TextIO]:
+    with TemporaryDirectory(dir=path.parent) as directory:
+        staging = Path(directory)
+        # Keep staging accessible to its owner even under a restrictive umask.
+        staging.chmod(0o700)
+        temporary_path = staging / "output"
+        with open(temporary_path, "x", encoding="utf-8", newline="\n",
+                  opener=lambda name, flags: os.open(name, flags, creation_mode)) as target:
+            yield target
+        if final_mode is not None:
+            temporary_path.chmod(final_mode)
         temporary_path.replace(path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
 
 
 def _state_key(value: str) -> str:
@@ -160,13 +176,13 @@ def _budget_event(record: Record, state: State, config: Config) -> dict | None:
 def process_records(records: list[Record], config: Config, state: State) -> list[dict]:
     ordered = sorted(
         (record for record in records if record.line_number > state["processed_lines"]),
-        key=lambda record: record.timestamp,
+        key=lambda record: record.utc_seconds,
     )
     if not ordered:
         return []
     latest = state["last_timestamp"]
     first = ordered[0]
-    if latest is not None and first.timestamp < datetime.fromisoformat(latest):
+    if latest is not None and first.utc_seconds < parse_timestamp(latest)[1]:
         raise ValueError(f"line {first.line_number}: timestamp is older than last processed time {latest}")
 
     requests_by_line = {record.line_number: record.call["request_id"] for record in records}
@@ -178,12 +194,12 @@ def process_records(records: list[Record], config: Config, state: State) -> list
         budget = _budget_event(record, state, config)
         if budget is not None:
             events.append(budget)
-    state["last_timestamp"] = ordered[-1].timestamp.isoformat()
+    state["last_timestamp"] = ordered[-1].call["ts"]
     return events
 
 
 def upgrade_state(state: State, records: list[Record], config: Config) -> State:
-    if "last_timestamp" in state:
+    if state.get("exact_timestamps") is True:
         return state
 
     # Rebuild the old cursor's counts and timestamp without printing old alerts.

@@ -1,10 +1,18 @@
 import json
+import os
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta
+from hashlib import sha256
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
+
+from agentwatch.__main__ import main
 
 START = datetime.fromisoformat("2026-11-27T10:00:00+08:00")
 
@@ -52,10 +60,10 @@ class TestM1(unittest.TestCase):
             for row in rows:
                 print(row if isinstance(row, str) else json.dumps(row), file=target)
 
-    def cli(self, command, *args, exit_code=0):
+    def cli(self, command, *args, exit_code=0, umask=-1):
         result = subprocess.run(
             [sys.executable, "-m", "agentwatch", command, "--log", str(self.log), *map(str, args)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, umask=umask,
         )
         self.assertEqual(result.returncode, exit_code, result.stderr)
         return result
@@ -393,3 +401,230 @@ class TestM1(unittest.TestCase):
         self.assertEqual(json.loads(self.state.read_text())["processed_lines"], 2)
         for private in (first["user"], first["request_id"]):
             self.assertNotIn(private, self.state.read_text())
+
+    def test_20_alerts_keep_submicrosecond_order_and_progress(self):
+        with self.subTest("sort within a microsecond"):
+            self.write_rows(
+                call(1, "timeout", ts="2026-11-27T02:00:00.000000900Z"),
+                call(2, ts="2026-11-27T10:00:00.000000100+08:00"),
+                call(3, "timeout", ts="2026-11-27T02:00:00.000001000Z"),
+            )
+            self.assertEqual(event_ids(events_from(self.alerts().stdout)), [
+                ("timeout_streak", ["r1", "r3"]),
+            ])
+
+        with self.subTest("reject an older append within a microsecond"):
+            self.state = self.directory / "incremental.json"
+            self.write_rows(call(1, "timeout", ts="2026-11-27T02:00:00.000000900Z"))
+            self.assertEqual(self.alerts().stdout, "")
+            previous_state = self.state.read_bytes()
+            self.write_rows(call(2, "timeout", ts="2026-11-27T10:00:00.000000100+08:00"),
+                            append=True)
+            rejected = self.alerts(exit_code=1)
+            self.assertEqual(rejected.stdout, "")
+            self.assertIn("line 2: timestamp is older", rejected.stderr)
+            self.assertEqual(self.state.read_bytes(), previous_state)
+
+    def test_21_alerts_do_not_emit_until_state_can_be_written(self):
+        root = Path(__file__).resolve().parents[1]
+        self.log = root / "data" / "sample.jsonl"
+        self.config = root / "config.json"
+        self.state = self.directory / "missing" / "state.json"
+
+        failed = self.alerts(exit_code=1)
+        self.assertIn("error:", failed.stderr)
+        self.assertEqual(len(events_from(failed.stdout)), 0)
+
+        self.state.parent.mkdir()
+        retried = events_from(self.alerts().stdout)
+        self.assertEqual(len(retried), 8)
+        self.assertEqual(len({(kind, tuple(ids)) for kind, ids in event_ids(retried)}), 8)
+        self.assertEqual(self.alerts().stdout, "")
+
+    def test_22_export_aliases_cannot_reuse_private_identifiers(self):
+        model = "model-1"
+        requests = ["request-1", "request-2"]
+        first = call(1, "timeout", model)
+        second = call(2, "timeout", model)
+        first["request_id"], second["request_id"] = requests
+        self.write_rows(first, second)
+        output = self.directory / "export.json"
+        self.cli("export", "--config", self.config, "--out", output)
+
+        report = json.loads(output.read_text())
+        event, = report["alerts"]
+        models = report["summary"]["by_model"]
+        self.assertTrue({model, *requests}.isdisjoint({*models, *event["request_ids"]}),
+                        (list(models), event["request_ids"]))
+        self.assertEqual(list(models), [event["model"]])
+        self.assertEqual(len(set(event["request_ids"])), 2)
+        self.assertEqual([record["request_id"] for record in event["records"]],
+                         event["request_ids"])
+        self.assertEqual([record["model"] for record in event["records"]], [event["model"]] * 2)
+
+    def test_23_failed_export_preserves_the_previous_report(self):
+        self.write_rows(call(1))
+        output = self.directory / "export.json"
+        self.cli("export", "--config", self.config, "--out", output)
+        previous_report = output.read_bytes()
+        previous_files = set(self.directory.iterdir())
+        self.write_rows(call(2), append=True)
+
+        stderr = StringIO()
+
+        def fail_report_write(value, *, file):
+            if file is stderr:
+                print(value, file=file)
+                return
+            file.write(value[:10])
+            raise OSError("simulated disk full")
+
+        argv = ["agentwatch", "export", "--log", str(self.log), "--config", str(self.config),
+                "--out", str(output)]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("agentwatch.__main__.print", fail_report_write, create=True),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(main(), 1)
+        self.assertIn("simulated disk full", stderr.getvalue())
+        self.assertEqual(output.read_bytes(), previous_report)
+        self.assertEqual(set(self.directory.iterdir()), previous_files)
+
+    def test_24_alerts_report_an_invalid_state_cursor(self):
+        self.write_rows(call(1))
+        for state, reason in (
+            ({}, "missing processed_lines"),
+            ({"processed_lines": -1}, "processed_lines must be a non-negative integer"),
+            ({"processed_lines": True}, "processed_lines must be a non-negative integer"),
+            ([], "must contain a JSON object"),
+        ):
+            with self.subTest(state=state):
+                original = json.dumps(state).encode()
+                self.state.write_bytes(original)
+                result = self.alerts(exit_code=1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(reason, result.stderr)
+                self.assertIn(str(self.state), result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.state.read_bytes(), original)
+
+    def test_25_alerts_rebuild_truncated_legacy_progress(self):
+        first = call(1, "timeout", ts="2026-11-27T02:00:00.000000900Z")
+        second = call(2, ts="2026-11-27T02:00:00.000000100Z")
+        # The old version processed these two calls in file order, clearing the streak.
+        legacy_state = json.dumps({
+            "processed_lines": 2,
+            "last_timestamp": "2026-11-27T02:00:00+00:00",
+            "timeouts": {},
+            "daily_usage": {sha256(b"alice").hexdigest(): {
+                "2026-11-27": {"tokens": 0, "alerted": False},
+            }},
+        }).encode()
+        for fraction, exit_code in (("000000500", 1), ("000001000", 0)):
+            with self.subTest(fraction=fraction):
+                self.state.write_bytes(legacy_state)
+                self.write_rows(first, second, call(3, "timeout", ts=f"2026-11-27T02:00:00.{fraction}Z"))
+                result = self.alerts(exit_code=exit_code)
+                if exit_code:
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("line 3: timestamp is older", result.stderr)
+                    self.assertEqual(self.state.read_bytes(), legacy_state)
+                else:
+                    self.assertEqual(event_ids(events_from(result.stdout)), [
+                        ("timeout_streak", ["r1", "r3"]),
+                    ])
+                    self.assertEqual(self.alerts().stdout, "")
+
+    def test_26_alerts_sort_by_utc_with_fractional_offsets(self):
+        self.write_rows(
+            call(1, "timeout", ts="2026-11-27T02:00:00.000000500Z"),
+            call(2, ts="2026-11-27T03:00:00.000000900+01:00:00.000000800"),
+            call(3, "timeout", ts="2026-11-27T03:00:00.000001800+01:00:00.000000800"),
+        )
+        result = self.alerts()
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(event_ids(events_from(result.stdout)), [
+            ("timeout_streak", ["r1", "r3"]),
+        ])
+        previous_state = self.state.read_bytes()
+        self.write_rows(call(4, ts="2026-11-27T02:00:00.000000999Z"), append=True)
+        result = self.alerts(exit_code=1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("line 4: timestamp is older", result.stderr)
+        self.assertEqual(self.state.read_bytes(), previous_state)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX file modes and umask")
+    def test_27_export_respects_file_permissions(self):
+        self.write_rows(call(1))
+        output = self.directory / "export.json"
+        with self.subTest("new report uses the umask"):
+            self.cli("export", "--config", self.config, "--out", output, umask=0o027)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o640)
+        with self.subTest("overwrite keeps the existing mode"):
+            output.chmod(0o644)
+            self.cli("export", "--config", self.config, "--out", output, umask=0o077)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o644)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX named pipes")
+    def test_28_export_streams_to_a_named_pipe(self):
+        self.write_rows(call(1))
+        output = self.directory / "export.pipe"
+        os.mkfifo(output)
+        reader = os.open(output, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            self.cli("export", "--config", self.config, "--out", output)
+            self.assertTrue(stat.S_ISFIFO(output.stat().st_mode))
+            report = json.loads(os.read(reader, 4096))
+            self.assertEqual(report["alerts"], [])
+            self.assertEqual(report["summary"]["by_user"]["user-1"]["calls"], 1)
+        finally:
+            os.close(reader)
+
+    def test_29_export_rejects_resolved_input_paths(self):
+        self.write_rows(call(1))
+        original_log = self.log.read_bytes()
+        original_config = self.config.read_bytes()
+        for option, source in (("--log", self.log), ("--config", self.config)):
+            linked = self.directory / f"linked-{source.name}"
+            linked.hardlink_to(source)
+            unresolved = self.directory / "missing" / ".." / source.name
+            for output in (linked, unresolved):
+                with self.subTest(output=output):
+                    self.log.write_bytes(original_log)
+                    self.config.write_bytes(original_config)
+                    result = self.cli("export", "--config", self.config, "--out", output,
+                                      exit_code=1)
+                    self.assertIn(f"--out must differ from {option}", result.stderr)
+                    self.assertEqual(self.log.read_bytes(), original_log)
+                    self.assertEqual(self.config.read_bytes(), original_config)
+
+    def test_30_alerts_keep_fraction_before_a_spaced_time_zone(self):
+        first = call(1, "timeout", ts="2026-11-27T02:00:00.900000000 +00:00")
+        older = call(2, ts="2026-11-27T02:00:00.100000000 +00:00")
+        next_timeout = call(3, "timeout", ts="2026-11-27T02:00:01.000000000 +00:00")
+        try:
+            datetime.fromisoformat(first["ts"])
+        except ValueError:
+            self.skipTest("datetime.fromisoformat does not accept a space before the time zone")
+
+        with self.subTest("sort fractions before the time zone"):
+            self.write_rows(first, older, next_timeout)
+            result = self.alerts()
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(event_ids(events_from(result.stdout)), [
+                ("timeout_streak", ["r1", "r3"]),
+            ])
+
+        with self.subTest("reject an older append within the same microsecond"):
+            self.state = self.directory / "incremental.json"
+            first["ts"] = "2026-11-27T02:00:00.000000900 +00:00"
+            older["ts"] = "2026-11-27T02:00:00.000000100 +00:00"
+            self.write_rows(first)
+            self.assertEqual(self.alerts().stdout, "")
+            previous_state = self.state.read_bytes()
+            self.write_rows(older, append=True)
+            result = self.alerts(exit_code=1)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("line 2: timestamp is older", result.stderr)
+            self.assertEqual(self.state.read_bytes(), previous_state)

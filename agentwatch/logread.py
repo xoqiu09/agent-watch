@@ -2,9 +2,10 @@
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import TypedDict
 
@@ -24,6 +25,7 @@ class Call(TypedDict):
 class Record:
     call: Call
     timestamp: datetime
+    utc_seconds: Decimal
     raw: str
     line_number: int
 
@@ -52,6 +54,52 @@ def _reject_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
 
+_TIMESTAMP_PARTS = re.compile(
+    r"(?P<clock>(?:[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{8}|[0-9]{4}-?W[0-9]{2}(?:-?[1-7])?)"
+    r".[0-9:]+)(?:[.,](?P<fraction>[0-9]+))?"
+    r"(?:(?P<zone_gap>[^0-9:Z+-][^Z+-]*)?"
+    r"(?:(?P<utc>Z)|(?P<offset>[+-][0-9:]+)(?:[.,](?P<offset_fraction>[0-9]+))?))?",
+    re.DOTALL,
+)
+
+
+def parse_timestamp(source: str) -> tuple[datetime, Decimal]:
+    parts = _TIMESTAMP_PARTS.fullmatch(source)
+    fraction = offset_fraction = "0"
+    offset_sign = 1
+    if parts is not None:
+        fraction = parts["fraction"] or "0"
+        offset_fraction = parts["offset_fraction"] or "0"
+        zone = parts["offset"] or ("+00:00" if parts["utc"] else "")
+        offset_sign = -1 if zone.startswith("-") else 1
+        # Let fromisoformat validate any gap before the zone as written.
+        if parts["zone_gap"] is None:
+            # Python 3.10 accepts six-digit fractions in both the clock and offset.
+            source = parts["clock"]
+            if parts["fraction"] is not None:
+                source += "." + fraction[:6].ljust(6, "0")
+            source += zone
+            if parts["offset_fraction"] is not None:
+                source += "." + offset_fraction[:6].ljust(6, "0")
+
+    try:
+        timestamp = datetime.fromisoformat(source)
+    except ValueError as exc:
+        raise ValueError("invalid ts") from exc
+    offset = timestamp.utcoffset()
+    if offset is None:
+        raise ValueError("ts must include a time zone")
+
+    seconds = ((timestamp.toordinal() * 24 + timestamp.hour) * 60 + timestamp.minute) * 60
+    seconds += timestamp.second - int(offset.total_seconds())
+    # Subtract the full signed offset fraction without rounding or changing the local date.
+    with localcontext() as context:
+        context.prec = len(str(seconds)) + max(len(fraction), len(offset_fraction)) + 1
+        utc_seconds = Decimal(seconds) + Decimal("0." + fraction)
+        utc_seconds -= offset_sign * Decimal("0." + offset_fraction)
+    return timestamp, utc_seconds
+
+
 def _parse(raw: str, line_number: int) -> Record:
     try:
         data = json.loads(raw, parse_float=Decimal, parse_constant=_reject_constant)
@@ -78,16 +126,9 @@ def _parse(raw: str, line_number: int) -> Record:
     if isinstance(latency, Decimal) and not math.isfinite(latency):
         raise ValueError("latency_ms must be finite")
 
-    ts = data["ts"]
-    try:
-        timestamp = datetime.fromisoformat(ts[:-1] + "+00:00" if ts.endswith("Z") else ts)
-    except ValueError as exc:
-        raise ValueError("invalid ts") from exc
-    if timestamp.utcoffset() is None:
-        raise ValueError("ts must include a time zone")
-
+    timestamp, utc_seconds = parse_timestamp(data["ts"])
     call = Call(
-        ts=ts,
+        ts=data["ts"],
         request_id=data["request_id"],
         user=data["user"],
         model=data["model"],
@@ -96,7 +137,7 @@ def _parse(raw: str, line_number: int) -> Record:
         tokens_in=data["tokens_in"],
         tokens_out=data["tokens_out"],
     )
-    return Record(call, timestamp, raw, line_number)
+    return Record(call, timestamp, utc_seconds, raw, line_number)
 
 
 def read_log(path: Path, *, defer_partial_tail: bool = False) -> Log:

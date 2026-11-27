@@ -3,13 +3,14 @@
 import argparse
 import json
 import re
+import stat
 import sys
 from datetime import date
 from decimal import Decimal
 from itertools import count
 from pathlib import Path
 
-from .alerts import new_state, process_records, read_config, read_state, upgrade_state, write_state
+from .alerts import atomic_output, new_state, process_records, read_config, read_state, upgrade_state
 from .logread import Log, read_log
 from .report import daily_comparison, write_report
 from .sample import write_sample
@@ -129,7 +130,19 @@ def _write_export(log: Log, log_path: Path, config_path: Path, output: Path) -> 
         latest_day = max(record.timestamp.date() for record in log.records)
         payload["report"], _ = daily_comparison(log.records, latest_day, config["prices"] or {})
     _check_output(output, log_path, config_path)
-    with output.open("w", encoding="utf-8", newline="\n") as target:
+    destination = output.resolve()
+    if destination != output:
+        _check_output(destination, log_path, config_path)
+    try:
+        mode = destination.stat().st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        report = destination.open("w", encoding="utf-8", newline="\n")
+    else:
+        report = atomic_output(destination, creation_mode=0o666,
+                               final_mode=stat.S_IMODE(mode) if mode is not None else None)
+    with report as target:
         print(_json_dumps(payload, indent=2), file=target)
 
 
@@ -164,11 +177,15 @@ def main() -> int:
             log.index_requests()
             config = read_config(args.config)
             state = upgrade_state(state, log.records, config)
-            for event in process_records(log.records, config, state):
-                print(json.dumps(event))
-            sys.stdout.flush()
+            events = process_records(log.records, config, state)
             state["processed_lines"] = log.line_count
-            write_state(args.state, state)
+            with atomic_output(args.state) as target:
+                json.dump(state, target)
+                # Closing surfaces buffered write errors before emitting any alerts.
+                target.close()
+                for event in events:
+                    print(json.dumps(event))
+                sys.stdout.flush()
         elif args.command == "trace":
             record = log.index_requests().get(args.request_id)
             if record is not None:
