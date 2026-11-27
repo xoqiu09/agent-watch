@@ -35,3 +35,18 @@ def write_sample(path: Path, seed: int) -> None:
             if index == 24:
                 print("not json", file=log)
         print('{"request_id":"broken"}', file=log)
+        # Keep the M1 day intact and give the second day a clear change to compare.
+        for index, (status, tokens_out) in enumerate((
+            ("timeout", 0), ("timeout", 0), ("ok", 20000), ("error", 0), ("ok", 20),
+        )):
+            record = {
+                "ts": (start + timedelta(days=1, seconds=45 * index)).isoformat(),
+                "request_id": f"r{201 + index:04d}",
+                "user": "alice",
+                "model": "model-a",
+                "latency_ms": 2600,
+                "status": status,
+                "tokens_in": 10,
+                "tokens_out": tokens_out,
+            }
+            print(json.dumps(record, separators=(",", ":")), file=log)

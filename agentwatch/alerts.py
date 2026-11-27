@@ -2,6 +2,8 @@
 
 import json
 from datetime import datetime
+from decimal import Decimal
+from fractions import Fraction
 from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -10,10 +12,19 @@ from typing import TypedDict
 from .logread import Record
 
 
+class Price(TypedDict):
+    in_per_1k: Fraction
+    out_per_1k: Fraction
+
+
+Prices = dict[str, Price]
+
+
 class Config(TypedDict):
     timeout_streak: int
     daily_token_budget: dict[str, int]
     default_daily_token_budget: int
+    prices: Prices | None
 
 
 class DailyUsage(TypedDict):
@@ -29,7 +40,7 @@ class State(TypedDict):
 
 
 def read_config(path: Path) -> Config:
-    config = json.loads(path.read_text(encoding="utf-8"))
+    config = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
     if not isinstance(config, dict):
         raise ValueError("config must be a JSON object")
     streak = config.get("timeout_streak")
@@ -47,7 +58,23 @@ def read_config(path: Path) -> Config:
         timeout_streak=streak,
         daily_token_budget=budgets,
         default_daily_token_budget=default,
+        prices=_parse_prices(config["prices"]) if "prices" in config else None,
     )
+
+
+def _parse_prices(raw: object) -> Prices:
+    if not isinstance(raw, dict):
+        raise ValueError("prices must map models to input and output prices")
+    prices: Prices = {}
+    for model, price in raw.items():
+        if not isinstance(price, dict) or any(
+            type(price.get(key)) not in (int, Decimal) for key in ("in_per_1k", "out_per_1k")
+        ):
+            raise ValueError(f"prices[{model!r}] must give numeric in_per_1k and out_per_1k")
+        prices[model] = Price(
+            in_per_1k=Fraction(price["in_per_1k"]), out_per_1k=Fraction(price["out_per_1k"]),
+        )
+    return prices
 
 
 def new_state() -> State:

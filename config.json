@@ -1,5 +1,9 @@
 {
   "timeout_streak": 2,
   "daily_token_budget": {"alice": 5000, "bob": 3000},
-  "default_daily_token_budget": 4000
+  "default_daily_token_budget": 4000,
+  "prices": {
+    "model-a": {"in_per_1k": 1.25, "out_per_1k": 4},
+    "model-b": {"in_per_1k": 2, "out_per_1k": 6}
+  }
 }

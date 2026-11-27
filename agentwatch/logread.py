@@ -4,6 +4,7 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TypedDict
 
@@ -13,7 +14,7 @@ class Call(TypedDict):
     request_id: str
     user: str
     model: str
-    latency_ms: int | float
+    latency_ms: int | Decimal
     status: str
     tokens_in: int
     tokens_out: int
@@ -52,7 +53,10 @@ def _reject_constant(value: str) -> None:
 
 
 def _parse(raw: str, line_number: int) -> Record:
-    data = json.loads(raw, parse_constant=_reject_constant)
+    try:
+        data = json.loads(raw, parse_float=Decimal, parse_constant=_reject_constant)
+    except InvalidOperation as exc:
+        raise ValueError("invalid JSON number") from exc
     if not isinstance(data, dict):
         raise ValueError("expected a JSON object")
     for field in Call.__annotations__:
@@ -69,9 +73,9 @@ def _parse(raw: str, line_number: int) -> Record:
             raise ValueError(f"{field} must be a non-negative integer")
 
     latency = data["latency_ms"]
-    if type(latency) not in (int, float) or latency < 0:
+    if type(latency) not in (int, Decimal) or latency < 0:
         raise ValueError("latency_ms must be a non-negative number")
-    if isinstance(latency, float) and not math.isfinite(latency):
+    if isinstance(latency, Decimal) and not math.isfinite(latency):
         raise ValueError("latency_ms must be finite")
 
     ts = data["ts"]
