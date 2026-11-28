@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,45 @@ class TestM2(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertEqual(result.stdout, "")
         self.assertIn("duplicate request_id 'r1' on lines 1 and 2", result.stderr)
+
+    def test_summary_skips_rows_with_duplicate_required_fields(self):
+        conflict = json.dumps(call(1, tokens_in=1000)).replace(
+            '"tokens_in": 1000', '"tokens_in": 1000, "tokens_in": 0',
+        )
+        valid = json.dumps(call(2, tokens_in=1000)).removesuffix("}")
+        self.write_rows(conflict, valid + ', "metadata": {"tokens_in": 8, "tokens_in": 9}}')
+
+        result = subprocess.run(
+            [sys.executable, "-m", "agentwatch", "summary",
+             "--log", str(self.log), "--config", str(self.config)],
+            capture_output=True, text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["bad_lines"], 1)
+        self.assertEqual(result.stderr.splitlines(), ["line 1: duplicate field: tokens_in"])
+        self.assertEqual(summary["by_model"]["model-a"]["calls"], 1)
+        self.assertEqual(summary["by_model"]["model-a"]["cost"], 1)
+
+    def test_summary_skips_rows_with_invalid_unicode_identifiers(self):
+        valid = call(1, user="用户😀", tokens_in=1000)
+        for field in ("user", "model", "request_id"):
+            with self.subTest(field=field):
+                self.write_rows(valid, {**call(2), field: "\ud83d"})
+                result = subprocess.run(
+                    [sys.executable, "-m", "agentwatch", "summary",
+                     "--log", str(self.log), "--config", str(self.config)],
+                    capture_output=True, text=True, encoding="utf-8",
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8:strict"},
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), [f"line 2: {field} must be valid UTF-8"])
+                summary = json.loads(result.stdout)
+                self.assertEqual(summary["bad_lines"], 1)
+                self.assertEqual(summary["by_model"]["model-a"]["calls"], 1)
+                self.assertEqual(summary["by_user"]["用户😀"]["cost"], 1)
 
     def test_summary_rejects_negative_prices_and_accepts_zero(self):
         self.write_rows(call(1, tokens_in=1000, tokens_out=1000))
@@ -253,6 +293,20 @@ class TestM2(unittest.TestCase):
         for flag in ("变慢", "失败变多", "费用上涨"):
             self.assertNotIn(flag, report)
         self.assertNotIn("2026-11-26", report)
+
+    def test_report_discloses_skipped_log_lines(self):
+        success = second_day(1)
+        timeout = second_day(2, "timeout")
+        del timeout["tokens_out"]
+        self.write_rows(success, timeout)
+
+        report = self.report()
+
+        self.assertIn(f"| {DAY} | 1 | 100.00% |", report)
+        self.assertIn("本次读取跳过 1 行，指标仅按有效记录计算", report)
+
+        self.write_rows(success)
+        self.assertNotIn("本次读取跳过", self.report())
 
     def test_report_recomputes_only_its_days_alerts_without_touching_state(self):
         self.write_rows(

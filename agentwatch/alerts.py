@@ -13,6 +13,9 @@ from typing import Iterator, TextIO, TypedDict
 from .logread import Record, parse_timestamp
 
 
+LOG_VALIDATION_VERSION = 1
+
+
 class Price(TypedDict):
     in_per_1k: Fraction
     out_per_1k: Fraction
@@ -37,6 +40,7 @@ class State(TypedDict):
     processed_lines: int
     last_timestamp: str | None
     exact_timestamps: bool
+    log_validation_version: int
     timeouts: dict[str, list[int]]
     daily_usage: dict[str, dict[str, DailyUsage]]
 
@@ -84,7 +88,10 @@ def _parse_prices(raw: object) -> Prices:
 
 
 def new_state() -> State:
-    return State(processed_lines=0, last_timestamp=None, exact_timestamps=True, timeouts={}, daily_usage={})
+    return State(
+        processed_lines=0, last_timestamp=None, exact_timestamps=True,
+        log_validation_version=LOG_VALIDATION_VERSION, timeouts={}, daily_usage={},
+    )
 
 
 def read_state(path: Path) -> State:
@@ -203,7 +210,8 @@ def process_records(records: list[Record], config: Config, state: State) -> list
 
 
 def upgrade_state(state: State, records: list[Record], config: Config) -> State:
-    if state.get("exact_timestamps") is True:
+    if (state.get("exact_timestamps") is True
+            and state.get("log_validation_version") == LOG_VALIDATION_VERSION):
         return state
 
     # Rebuild the old cursor's counts and timestamp without printing old alerts.

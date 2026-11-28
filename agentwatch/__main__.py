@@ -208,7 +208,7 @@ def main() -> int:
                 state_lock = lock_path.open("r")
             fcntl.flock(state_lock, fcntl.LOCK_EX)
         state = read_state(args.state) if is_alerts else new_state()
-        log = read_log(args.log, defer_partial_tail=is_alerts)
+        log = read_log(args.log, defer_partial_tail=is_alerts, processed_lines=state["processed_lines"])
         for line_number, reason in log.bad_lines:
             if line_number > state["processed_lines"]:
                 print(f"line {line_number}: {reason}", file=sys.stderr)
@@ -244,7 +244,8 @@ def main() -> int:
         elif args.command == "report":
             log.index_requests()
             _check_output(args.out, args.log, args.config)
-            write_report(log.records, args.date, read_config(args.config), args.out)
+            write_report(log.records, args.date, read_config(args.config), args.out,
+                         bad_line_count=len(log.bad_lines))
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
