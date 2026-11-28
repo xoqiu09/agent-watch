@@ -40,7 +40,7 @@ def _p95_slower(current: int | Decimal, previous: int | Decimal) -> bool:
         context.prec = len(previous.as_tuple().digits) + 2
         context.Emin = MIN_EMIN
         context.Emax = MAX_EMAX
-        return current > previous * Decimal("1.3")
+        return previous > 0 and current > previous * Decimal("1.3")
 
 
 def daily_comparison(

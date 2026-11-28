@@ -142,6 +142,19 @@ class TestM2(unittest.TestCase):
             "model-a 1099511627776.0001", "日报费用 1099511627776.0001",
         ])
 
+    def test_readme_display_handles_config_without_prices(self):
+        self.config.write_text(json.dumps({
+            "timeout_streak": 2,
+            "daily_token_budget": {"alice": 5000, "bob": 3000},
+            "default_daily_token_budget": 4000,
+        }), encoding="utf-8")
+        self.write_rows(second_day(1, tokens_in=120, tokens_out=340))
+
+        result = self._run_readme_display()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["model-a 未配置价格", "日报费用 未定价"])
+
     def test_readme_display_handles_an_empty_export(self):
         self.log.touch()
 
@@ -179,6 +192,15 @@ class TestM2(unittest.TestCase):
             with self.subTest(latency=latency):
                 self.write_rows(call(1, latency=100.1), second_day(2, latency=latency))
                 self.assertEqual("变慢" in self.report(), flagged)
+
+    def test_p95_skips_growth_from_zero(self):
+        self.write_rows(call(1, latency=0), second_day(2, latency=1))
+
+        report = self.report()
+
+        self.assertIn(f"| {DAY} | 1 | 100.00% | 1 ms |", report)
+        self.assertIn("| 2026-11-27 | 1 | 100.00% | 0 ms |", report)
+        self.assertNotIn("变慢", report)
 
     def test_p95_compares_exact_json_decimals_at_thirty_percent(self):
         yesterday = json.dumps(call(1, latency=0))
