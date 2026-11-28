@@ -11,7 +11,7 @@ from typing import TypedDict
 
 
 class _LogValidationError(ValueError):
-    """A complete JSON row rejected by the newer field checks."""
+    """A complete JSON row rejected by newer log validation rules."""
 
 
 class Call(TypedDict):
@@ -69,12 +69,19 @@ _TIMESTAMP_PARTS = re.compile(
 
 def parse_timestamp(source: str) -> tuple[datetime, Decimal]:
     parts = _TIMESTAMP_PARTS.fullmatch(source)
+    # Keep the supported date/time separator. Python can ignore a NUL near the offset.
+    if "\0" in source and (parts is None or "\0" in (parts["zone_gap"] or "")):
+        raise _LogValidationError("invalid ts")
+
     fraction = offset_fraction = "0"
     offset_sign = 1
     if parts is not None:
         fraction = parts["fraction"] or "0"
         offset_fraction = parts["offset_fraction"] or "0"
         zone = parts["offset"] or ("+00:00" if parts["utc"] else "")
+        offset_minutes = zone[1:].replace(":", "")[2:4]
+        if offset_minutes and int(offset_minutes) > 59:
+            raise _LogValidationError("invalid ts time zone offset minutes")
         offset_sign = -1 if zone.startswith("-") else 1
         # Let fromisoformat validate any gap before the zone as written.
         if parts["zone_gap"] is None:

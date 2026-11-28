@@ -344,6 +344,30 @@ class TestM2(unittest.TestCase):
         alert_section = self.report().split("## 当天告警\n\n")[1].strip()
         self.assertEqual(alert_section, "仅按当天调用重算，未触发告警")
 
+    def test_report_rejects_out_of_range_time_zone_minutes(self):
+        cases = (
+            ("", "invalid ts time zone offset minutes"),
+            ("\0", "invalid ts"),
+            (":00.000000\0x", "invalid ts"),
+        )
+        for suffix, reason in cases:
+            with self.subTest(suffix=suffix):
+                self.write_rows(
+                    call(1, "timeout", ts=f"{DAY}T10:00:01+08:00"),
+                    call(2, "timeout", ts=f"{DAY}T11:00:02+08:60{suffix}"),
+                )
+                result = subprocess.run(
+                    [sys.executable, "-m", "agentwatch", "report", "--log", str(self.log),
+                     "--config", str(self.config), "--date", DAY, "--out", str(self.output)],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, f"line 2: {reason}\n")
+                report = self.output.read_text(encoding="utf-8")
+                self.assertIn("本次读取跳过 1 行，指标仅按有效记录计算", report)
+                self.assertIn(f"| {DAY} | 1 | 0.00% |", report)
+                self.assertNotIn("连续超时", report)
+
     def test_report_replaces_output_links_without_overwriting_state(self):
         self.write_rows(second_day(1))
         for link in (self.output.hardlink_to, self.output.symlink_to):
@@ -386,6 +410,21 @@ class TestM2(unittest.TestCase):
         self.assertIn(r"alice - \*\*user\*\*", lines[0])
         self.assertTrue(lines[0].endswith(r"请求 r1 - \[request\]"))
         self.assertIn(r"model-b - \<model\>", lines[1])
+
+    def test_report_quotes_alert_request_ids_containing_commas_or_quotes(self):
+        requests = (
+            ("timeout", "a, b"), ("timeout", "c"), ("ok", 'r"3'),
+            ("timeout", "a"), ("timeout", "b, c"),
+        )
+        self.write_rows(*(
+            {**second_day(number, status), "request_id": request_id}
+            for number, (status, request_id) in enumerate(requests, 1)
+        ))
+        self.assertEqual(self.report().split("## 当天告警\n\n")[1].splitlines(), [
+            f'- {DAY}T00:00:02+08:00 model-a 连续超时，请求 "a, b", c',
+            f'- {DAY}T00:00:03+08:00 model-a 恢复，请求 "r""3"',
+            f'- {DAY}T00:00:05+08:00 model-a 连续超时，请求 a, "b, c"',
+        ])
 
     def test_export_includes_aliased_costs_and_the_reports_comparison(self):
         model = "private-model.example"

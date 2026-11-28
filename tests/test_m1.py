@@ -576,9 +576,13 @@ raise SystemExit(cli.main())
     def test_alerts_rebuild_state_after_log_validation_changes(self):
         user_key = sha256(b"alice").hexdigest()
         model_key = sha256(b"model-a").hexdigest()
-        for status, field in (("timeout", "tokens_in"), ("timeout", "request_id"),
-                              ("error", "tokens_in")):
-            with self.subTest(status=status, field=field):
+        for status, field, validation in (
+            ("timeout", "tokens_in", {}),
+            ("timeout", "request_id", {}),
+            ("error", "tokens_in", {}),
+            ("timeout", "tokens_in", {"offset_minutes_validated": True}),
+        ):
+            with self.subTest(status=status, field=field, validation=validation):
                 rejected = call(2, status, tokens_in=6)
                 if field == "request_id":
                     bad_row = json.dumps({**rejected, "request_id": "\ud83d"})
@@ -593,6 +597,7 @@ raise SystemExit(cli.main())
                     "exact_timestamps": True,
                     "timeouts": {model_key: [2]} if status == "timeout" else {},
                     "daily_usage": {user_key: {"2026-11-27": {"tokens": 8, "alerted": False}}},
+                    **validation,
                 }), encoding="utf-8")
 
                 result = self.alerts()
@@ -600,6 +605,7 @@ raise SystemExit(cli.main())
                 upgraded = json.loads(self.state.read_text())
                 self.assertEqual(upgraded["processed_lines"], 3)
                 self.assertEqual(upgraded["log_validation_version"], 1)
+                self.assertIs(upgraded["offset_minutes_validated"], True)
 
                 self.write_rows(call(4, "timeout", tokens_in=6), append=True)
                 events = events_from(self.alerts().stdout)
@@ -610,26 +616,35 @@ raise SystemExit(cli.main())
                 self.assertEqual(self.alerts().stdout, "")
 
     def test_alerts_upgrade_keeps_processed_bad_tail_without_newline(self):
-        rejected = call(1, "error")
-        bad_row = json.dumps({**rejected, "request_id": "\ud83d"})
-        self.log.write_text(bad_row, encoding="utf-8")
-        self.state.write_text(json.dumps({
-            "processed_lines": 1,
-            "last_timestamp": rejected["ts"],
-            "exact_timestamps": True,
-            "timeouts": {},
-            "daily_usage": {sha256(b"alice").hexdigest(): {
-                "2026-11-27": {"tokens": 0, "alerted": False},
-            }},
-        }), encoding="utf-8")
+        for bad_fields in (
+            {"request_id": "\ud83d"},
+            {"ts": "2026-11-27T10:00:01+08:60"},
+            {"ts": "2026-11-27T10:00:01+08:60\0"},
+        ):
+            with self.subTest(bad_fields=bad_fields):
+                rejected = {**call(1, "error"), **bad_fields}
+                bad_row = json.dumps(rejected)
+                self.log.write_text(bad_row, encoding="utf-8")
+                self.state.write_text(json.dumps({
+                    "processed_lines": 1,
+                    "last_timestamp": rejected["ts"],
+                    "exact_timestamps": True,
+                    "timeouts": {},
+                    "daily_usage": {sha256(b"alice").hexdigest(): {
+                        "2026-11-27": {"tokens": 0, "alerted": False},
+                    }},
+                }), encoding="utf-8")
 
-        for _ in range(2):
-            result = self.alerts()
-            self.assertEqual((result.stdout, result.stderr), ("", ""))
-            self.assertEqual(json.loads(self.state.read_text())["processed_lines"], 1)
+                for _ in range(2):
+                    result = self.alerts()
+                    self.assertEqual((result.stdout, result.stderr), ("", ""))
+                    saved = json.loads(self.state.read_text())
+                    self.assertEqual(saved["processed_lines"], 1)
+                    self.assertIsNone(saved["last_timestamp"])
 
-        self.log.write_text(bad_row[:-1], encoding="utf-8")
-        self.assertIn("log is shorter than saved alert progress", self.alerts(exit_code=1).stderr)
+                self.log.write_text(bad_row[:-1], encoding="utf-8")
+                result = self.alerts(exit_code=1)
+                self.assertIn("log is shorter than saved alert progress", result.stderr)
 
     def test_20_alerts_keep_submicrosecond_order_and_progress(self):
         with self.subTest("sort within a microsecond"):
@@ -788,6 +803,53 @@ raise SystemExit(cli.main())
                         ("timeout_streak", ["r1", "r3"]),
                     ])
                     self.assertEqual(self.alerts().stdout, "")
+
+    def test_alerts_rebuild_legacy_progress_with_invalid_offset_minutes(self):
+        day = "2026-11-27"
+        invalid = call(1, "timeout", ts=f"{day}T10:00:01+08:60", tokens_in=8)
+        valid = call(2, "timeout", "model-b", user="bob", tokens_in=101)
+        alice = sha256(b"alice").hexdigest()
+        bob = sha256(b"bob").hexdigest()
+        for history, validation in (
+            ([invalid], {}),
+            ([invalid, valid], {}),
+            ([invalid], {"log_validation_version": 1}),
+            ([invalid, valid], {"log_validation_version": 1}),
+        ):
+            with self.subTest(saved_through=len(history), validation=validation):
+                self.write_rows(*history)
+                # The previous parser accepted line 1 and saved its timeout and tokens.
+                timeouts = {sha256(b"model-a").hexdigest(): [1]}
+                usage = {alice: {day: {"tokens": 8, "alerted": False}}}
+                if len(history) == 2:
+                    timeouts[sha256(b"model-b").hexdigest()] = [2]
+                    usage[bob] = {day: {"tokens": 101, "alerted": True}}
+                self.state.write_text(json.dumps({
+                    "processed_lines": len(history),
+                    "last_timestamp": history[-1]["ts"],
+                    "exact_timestamps": True,
+                    "timeouts": timeouts,
+                    "daily_usage": usage,
+                    **validation,
+                }))
+
+                appended = call(3, "timeout", tokens_in=3)
+                self.write_rows(appended, append=True)
+                result = self.alerts()
+                self.assertEqual((result.stdout, result.stderr), ("", ""))
+                saved = json.loads(self.state.read_text())
+                self.assertEqual(saved["processed_lines"], len(history) + 1)
+                self.assertEqual(saved["last_timestamp"], appended["ts"])
+                self.assertEqual(saved["daily_usage"][alice][day], {"tokens": 3, "alerted": False})
+                if len(history) == 2:
+                    self.assertEqual(saved["daily_usage"][bob], usage[bob])
+
+                self.write_rows(call(4, "timeout", tokens_in=8), append=True)
+                self.assertEqual(event_ids(events_from(self.alerts().stdout)), [
+                    ("timeout_streak", ["r3", "r4"]),
+                    ("budget_exceeded", ["r4"]),
+                ])
+                self.assertEqual(self.alerts().stdout, "")
 
     def test_26_alerts_sort_by_utc_with_fractional_offsets(self):
         self.write_rows(
