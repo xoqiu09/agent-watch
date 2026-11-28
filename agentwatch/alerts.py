@@ -1,9 +1,9 @@
-"""Evaluate timeout and token budget rules and persist the log position."""
+"""Evaluate alert rules and persist the log position."""
 
 import json
 import os
 from contextlib import contextmanager
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from hashlib import sha256
 from pathlib import Path
@@ -29,6 +29,7 @@ class Config(TypedDict):
     daily_token_budget: dict[str, int]
     default_daily_token_budget: int
     prices: Prices | None
+    slow_call_ms: int | None
 
 
 class DailyUsage(TypedDict):
@@ -46,8 +47,16 @@ class State(TypedDict):
     daily_usage: dict[str, dict[str, DailyUsage]]
 
 
+def _parse_config_float(value: str) -> Decimal | None:
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        # Leave unrepresentable numbers for the field validators to reject.
+        return None
+
+
 def read_config(path: Path) -> Config:
-    config = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+    config = json.loads(path.read_text(encoding="utf-8"), parse_float=_parse_config_float)
     if not isinstance(config, dict):
         raise ValueError("config must be a JSON object")
     streak = config.get("timeout_streak")
@@ -61,11 +70,15 @@ def read_config(path: Path) -> Config:
     default = config.get("default_daily_token_budget")
     if type(default) is not int or default < 0:
         raise ValueError("default_daily_token_budget must be a non-negative integer")
+    slow_call_ms = config.get("slow_call_ms")
+    if "slow_call_ms" in config and (type(slow_call_ms) is not int or slow_call_ms < 1):
+        raise ValueError("slow_call_ms must be a positive integer")
     return Config(
         timeout_streak=streak,
         daily_token_budget=budgets,
         default_daily_token_budget=default,
         prices=_parse_prices(config["prices"]) if "prices" in config else None,
+        slow_call_ms=slow_call_ms,
     )
 
 
@@ -186,7 +199,9 @@ def _budget_event(record: Record, state: State, config: Config) -> dict | None:
     return None
 
 
-def process_records(records: list[Record], config: Config, state: State) -> list[dict]:
+def process_records(
+    records: list[Record], config: Config, state: State, *, slow_call_ms: int | None = None,
+) -> list[dict]:
     ordered = sorted(
         (record for record in records if record.line_number > state["processed_lines"]),
         key=lambda record: record.utc_seconds,
@@ -207,6 +222,15 @@ def process_records(records: list[Record], config: Config, state: State) -> list
         budget = _budget_event(record, state, config)
         if budget is not None:
             events.append(budget)
+        call = record.call
+        if slow_call_ms is not None and call["status"] == "ok" and call["latency_ms"] > slow_call_ms:
+            events.append({
+                "type": "slow_call",
+                "ts": call["ts"],
+                "model": call["model"],
+                "request_id": call["request_id"],
+                "latency_ms": call["latency_ms"],
+            })
     state["last_timestamp"] = ordered[-1].call["ts"]
     return events
 

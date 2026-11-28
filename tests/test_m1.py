@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from io import StringIO
 from pathlib import Path
@@ -73,6 +74,11 @@ class TestM1(unittest.TestCase):
     def alerts(self, *, exit_code=0):
         return self.cli("alerts", "--config", self.config, "--state", self.state,
                         exit_code=exit_code)
+
+    def set_slow_call_ms(self, value):
+        config = json.loads(self.config.read_text(encoding="utf-8"))
+        config["slow_call_ms"] = value
+        self.config.write_text(json.dumps(config), encoding="utf-8")
 
     def test_01_success_resets_streak_and_recovers(self):
         actual = []
@@ -149,6 +155,55 @@ class TestM1(unittest.TestCase):
         ])
         self.assertEqual(json.loads(self.state.read_text())["processed_lines"], 5)
         self.assertEqual(self.alerts().stdout, "")
+
+    def test_slow_call_requires_success_and_strictly_exceeds_threshold(self):
+        self.set_slow_call_ms(100)
+        just_over = "100.00000000000000001"
+        slow = call(3, model="model-b", latency=101)
+        self.write_rows(
+            call(1, latency=99),
+            call(2, latency=100),
+            json.dumps(slow).replace('"latency_ms": 101', f'"latency_ms": {just_over}'),
+            call(4, "timeout", latency=102),
+            call(5, "error", latency=103),
+            call(6, latency=104),
+        )
+
+        events = [json.loads(line, parse_float=Decimal)
+                  for line in self.alerts().stdout.splitlines()]
+        self.assertEqual(events, [
+            {"type": "slow_call", "ts": slow["ts"], "model": "model-b",
+             "request_id": "r3", "latency_ms": Decimal(just_over)},
+            {"type": "slow_call", "ts": call(6)["ts"], "model": "model-a",
+             "request_id": "r6", "latency_ms": 104},
+        ])
+
+    def test_slow_call_is_opt_in_and_uses_saved_progress(self):
+        self.write_rows(call(1, latency=101))
+        self.assertEqual(self.alerts().stdout, "")
+
+        self.set_slow_call_ms(100)
+        self.assertEqual(self.alerts().stdout, "")
+        self.write_rows(call(2, latency=102), append=True)
+        events = events_from(self.alerts().stdout)
+        self.assertEqual([event["request_id"] for event in events], ["r2"])
+        self.assertEqual(self.alerts().stdout, "")
+
+    def test_slow_call_rejects_invalid_thresholds(self):
+        self.write_rows(call(1, latency=101))
+        self.set_slow_call_ms(100)
+        config = self.config.read_text(encoding="utf-8")
+        for value in ("0", "-1", "1.0", "1.5", "true", "null", '"100"', "1e-10000000000000000000"):
+            with self.subTest(value=value):
+                self.config.write_text(
+                    config.replace('"slow_call_ms": 100', f'"slow_call_ms": {value}'),
+                    encoding="utf-8",
+                )
+                result = self.alerts(exit_code=1)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("slow_call_ms must be a positive integer", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(self.state.exists())
 
     def test_concurrent_alerts_do_not_rewind_state_or_repeat_events(self):
         import fcntl

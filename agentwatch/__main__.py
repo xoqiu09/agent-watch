@@ -223,14 +223,14 @@ def main() -> int:
             log.index_requests()
             config = read_config(args.config)
             state = upgrade_state(state, log.records, config)
-            events = process_records(log.records, config, state)
+            events = process_records(log.records, config, state, slow_call_ms=config["slow_call_ms"])
             state["processed_lines"] = log.line_count
             with atomic_output(args.state) as target:
                 json.dump(state, target)
                 # Closing surfaces buffered write errors before emitting any alerts.
                 target.close()
                 for event in events:
-                    print(json.dumps(event))
+                    print(_json_dumps(event))
                 sys.stdout.flush()
         elif args.command == "trace":
             record = log.index_requests().get(args.request_id)
