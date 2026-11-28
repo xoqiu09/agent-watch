@@ -218,6 +218,8 @@ def main() -> int:
             prices = read_config(args.config)["prices"] if args.config is not None else None
             print(_json_dumps(summarize(log, prices=prices), ensure_ascii=prices is None))
         elif args.command == "alerts":
+            if log.line_count < state["processed_lines"]:
+                raise ValueError("log is shorter than saved alert progress")
             log.index_requests()
             config = read_config(args.config)
             state = upgrade_state(state, log.records, config)

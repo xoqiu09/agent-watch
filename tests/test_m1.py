@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -311,6 +312,25 @@ raise SystemExit(cli.main())
         missing = self.cli("trace", "absent", exit_code=1)
         self.assertIn("not found: absent", missing.stderr)
 
+    def test_readme_trace_retrieves_option_like_request_id(self):
+        original = " " + json.dumps(dict(call(1, tokens_in=11), request_id="--help")) + "  "
+        self.write_rows(original)
+        event, = events_from(self.alerts().stdout)
+        request_id, = event["request_ids"]
+
+        readme = Path(__file__).resolve().parents[1] / "README.md"
+        example = next(
+            line for line in readme.read_text(encoding="utf-8").splitlines()
+            if line.startswith("python3 -m agentwatch trace ")
+        )
+        args = shlex.split(example)
+        args[0] = sys.executable
+        args[args.index("--log") + 1] = str(self.log)
+        args[-1] = request_id
+        result = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, original + "\n")
+
     def test_08_export_is_private_and_byte_repeatable(self):
         record = call(1, "timeout", user="private-alice", tokens_in=101)
         record.update(hostname="private-host.example", path="/private/log/calls.jsonl")
@@ -436,6 +456,23 @@ raise SystemExit(cli.main())
         self.assertIn("line 2:", incremental.stderr)
         self.assertIn("older than", incremental.stderr)
         self.assertEqual(self.state.read_bytes(), previous_state)
+
+    def test_alerts_reject_shorter_log_without_rewinding_state(self):
+        first = call(1, user="bob", tokens_in=40)
+        second = call(2, user="bob", tokens_in=40)
+        self.write_rows(first, second)
+        self.assertEqual(self.alerts().stdout, "")
+        previous_state = self.state.read_bytes()
+
+        self.write_rows(first)
+        shortened = self.alerts(exit_code=1)
+        self.assertEqual(shortened.stdout, "")
+        self.assertIn("log is shorter than saved alert progress", shortened.stderr)
+        self.assertEqual(self.state.read_bytes(), previous_state)
+
+        self.write_rows(second, append=True)
+        restored = self.alerts()
+        self.assertEqual((restored.stdout, restored.stderr), ("", ""))
 
     def test_13_duplicate_request_ids_report_conflicting_lines(self):
         self.write_rows(call(1), "bad")

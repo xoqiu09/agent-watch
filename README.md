@@ -8,7 +8,7 @@
 
 ## 怎么验证的
 
-本地运行 `python3 -m unittest`，**59 项全部通过**。测试确认连续超时达到门槛才告警，告警后首次成功会记录恢复，每位用户每天首次超过 token 预算时提醒一次。沿用同一状态文件重跑同一份日志，不会重复告警。测试也核对了请求追溯、费用计算和日报比较。
+本地运行 `python3 -m unittest -v`，**全量 62 项通过**。测试确认连续超时达到门槛才告警，告警后首次成功会记录恢复，每位用户每天首次超过 token 预算时提醒一次。沿用同一状态文件重跑同一份日志，不会重复告警。测试也核对了请求追溯、费用计算和日报比较。
 
 在临时副本里故意让成功后超时计数不清零、超额反复告警、日报刚到门槛就标记变慢。对应测试都失败，恢复规则后通过。
 
@@ -30,7 +30,7 @@ python3 -m agentwatch summary --log data/sample.jsonl --config config.json
 agent-watch is a Python CLI for support teams investigating slow AI responses and token budget overruns.\
 It summarizes usage, latency, and estimated costs and compares them in a daily report.\
 It flags repeated timeouts, recoveries, and token budget overruns and traces alerts to the original calls.\
-All 47 tests passed locally, and deliberate rule changes made the relevant tests fail.\
+All 62 tests passed locally, and deliberate rule changes made the relevant tests fail.\
 The demo uses fictional data, models, and users. The owner set requirements and acceptance criteria and directed AI coding tools to build it.
 
 ## 运行演示
@@ -44,7 +44,7 @@ cmp data/sample.jsonl "$demo/calls.jsonl"
 python3 -m agentwatch summary --log "$demo/calls.jsonl" --config config.json
 python3 -m agentwatch alerts --log "$demo/calls.jsonl" --config config.json --state "$demo/state.json"
 python3 -m agentwatch alerts --log "$demo/calls.jsonl" --config config.json --state "$demo/state.json"
-python3 -m agentwatch trace --log "$demo/calls.jsonl" r0001
+python3 -m agentwatch trace --log "$demo/calls.jsonl" -- r0001
 python3 -m agentwatch report --log "$demo/calls.jsonl" --config config.json --date 2026-11-28 --out "$demo/report.md"
 cat "$demo/report.md"
 python3 -m agentwatch export --log "$demo/calls.jsonl" --config config.json --out "$demo/demo.json"

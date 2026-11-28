@@ -67,12 +67,16 @@ def read_config(path: Path) -> Config:
 def _parse_prices(raw: object) -> Prices:
     if not isinstance(raw, dict):
         raise ValueError("prices must map models to input and output prices")
+    price_fields = ("in_per_1k", "out_per_1k")
     prices: Prices = {}
     for model, price in raw.items():
         if not isinstance(price, dict) or any(
-            type(price.get(key)) not in (int, Decimal) for key in ("in_per_1k", "out_per_1k")
+            type(price.get(field)) not in (int, Decimal) for field in price_fields
         ):
             raise ValueError(f"prices[{model!r}] must give numeric in_per_1k and out_per_1k")
+        for field in price_fields:
+            if price[field] < 0:
+                raise ValueError(f"prices[{model!r}].{field} must be non-negative")
         prices[model] = Price(
             in_per_1k=Fraction(price["in_per_1k"]), out_per_1k=Fraction(price["out_per_1k"]),
         )
