@@ -40,6 +40,7 @@ class DailyUsage(TypedDict):
 class State(TypedDict):
     processed_lines: int
     log_digest: str | None
+    timeout_streak: int | None
     last_timestamp: str | None
     exact_timestamps: bool
     log_validation_version: int
@@ -128,7 +129,8 @@ def _parse_prices(raw: object) -> Prices:
 
 def new_state() -> State:
     return State(
-        processed_lines=0, log_digest=None, last_timestamp=None, exact_timestamps=True,
+        processed_lines=0, log_digest=None, timeout_streak=None,
+        last_timestamp=None, exact_timestamps=True,
         log_validation_version=LOG_VALIDATION_VERSION, offset_minutes_validated=True,
         timeouts={}, alerted_timeouts={}, daily_usage={},
     )
@@ -288,6 +290,12 @@ def upgrade_state(state: State, records: list[Record], config: Config) -> State:
                     continue
                 if call is None or call["status"] != "timeout" or _state_key(call["model"]) != model:
                     raise ValueError("log does not match saved alert progress")
+
+    saved_streak = state.get("timeout_streak")
+    if saved_streak is None and saved_timeouts:
+        raise ValueError("cannot verify timeout_streak for legacy alert state with pending timeouts")
+    if saved_streak is not None and saved_streak != config["timeout_streak"]:
+        raise ValueError("timeout_streak changed since the alert state was saved")
 
     if "alerted_timeouts" not in state:
         state["alerted_timeouts"] = {

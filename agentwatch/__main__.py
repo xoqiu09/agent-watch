@@ -35,7 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     summary.add_argument("--config", type=Path)
     for command in (alerts, export, report):
         command.add_argument("--config", type=Path, required=True)
-    alerts.add_argument("--state", type=Path, required=True)
+    alerts.add_argument("--state", required=True)
     trace.add_argument("request_id")
     sample.add_argument("--seed", type=int, required=True)
     sample.add_argument("--out", type=Path, required=True)
@@ -149,14 +149,38 @@ def _write_export(log: Log, log_path: Path, config_path: Path, output: Path) -> 
         print(_json_dumps(payload, indent=2), file=target)
 
 
-def _check_output(output: Path, log_path: Path, config_path: Path) -> None:
+def _check_output(
+    output: Path, log_path: Path, config_path: Path, *, output_option: str = "--out",
+) -> None:
     for option, source in (("--log", log_path), ("--config", config_path)):
         try:
             same_file = output.samefile(source)
         except FileNotFoundError:
             continue
         if same_file:
-            raise ValueError(f"--out must differ from {option}")
+            raise ValueError(f"{output_option} must differ from {option}")
+
+
+def _resolve_alert_state(candidate: str) -> Path:
+    while True:
+        try:
+            os.stat(candidate)
+            break
+        except FileNotFoundError:
+            try:
+                mode = os.lstat(candidate).st_mode
+            except FileNotFoundError:
+                parent, name = os.path.split(candidate)
+                # Only the state file itself may be missing.
+                if name in ("", ".", ".."):
+                    raise
+                parent = parent or "."
+                os.stat(parent)
+                return Path(os.path.realpath(parent, strict=True)) / name
+            if not stat.S_ISLNK(mode):
+                break
+            candidate = os.path.join(os.path.dirname(candidate), os.readlink(candidate))
+    return Path(os.path.realpath(candidate, strict=True))
 
 
 def _alert_lock_path(state: Path) -> Path:
@@ -191,6 +215,8 @@ def main() -> int:
             except ImportError as exc:
                 raise ValueError("alerts requires Unix file locking (fcntl)") from exc
 
+            args.state = _resolve_alert_state(args.state)
+            _check_output(args.state, args.log, args.config, output_option="--state")
             # The state file is replaced on save, so lock a separate, stable file.
             lock_path = _alert_lock_path(args.state)
             for option, source in (("--log", args.log), ("--config", args.config)):
@@ -229,6 +255,7 @@ def main() -> int:
             events = process_records(log.records, config, state, slow_call_ms=config["slow_call_ms"])
             state["processed_lines"] = log.line_count
             state["log_digest"] = log.content_digest
+            state["timeout_streak"] = config["timeout_streak"]
             with atomic_output(args.state) as target:
                 json.dump(state, target)
                 # Closing surfaces buffered write errors before emitting any alerts.
