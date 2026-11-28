@@ -41,6 +41,7 @@ class State(TypedDict):
     last_timestamp: str | None
     exact_timestamps: bool
     log_validation_version: int
+    offset_minutes_validated: bool
     timeouts: dict[str, list[int]]
     daily_usage: dict[str, dict[str, DailyUsage]]
 
@@ -90,7 +91,8 @@ def _parse_prices(raw: object) -> Prices:
 def new_state() -> State:
     return State(
         processed_lines=0, last_timestamp=None, exact_timestamps=True,
-        log_validation_version=LOG_VALIDATION_VERSION, timeouts={}, daily_usage={},
+        log_validation_version=LOG_VALIDATION_VERSION, offset_minutes_validated=True,
+        timeouts={}, daily_usage={},
     )
 
 
@@ -210,11 +212,14 @@ def process_records(records: list[Record], config: Config, state: State) -> list
 
 
 def upgrade_state(state: State, records: list[Record], config: Config) -> State:
-    if (state.get("exact_timestamps") is True
-            and state.get("log_validation_version") == LOG_VALIDATION_VERSION):
+    if (
+        state.get("exact_timestamps") is True
+        and state.get("log_validation_version") == LOG_VALIDATION_VERSION
+        and state.get("offset_minutes_validated") is True
+    ):
         return state
 
-    # Rebuild the old cursor's counts and timestamp without printing old alerts.
+    # Rebuild the saved prefix with all current checks without re-emitting old alerts.
     processed_lines = state["processed_lines"]
     upgraded = new_state()
     process_records([record for record in records if record.line_number <= processed_lines],

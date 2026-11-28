@@ -107,6 +107,13 @@ def _inline_text(value: str) -> str:
     return " ".join(value.splitlines()).translate(_MARKDOWN_ESCAPES)
 
 
+def _request_id_text(value: str) -> str:
+    value = _inline_text(value)
+    if "," in value or '"' in value:
+        return '"' + value.replace('"', '""') + '"'
+    return value
+
+
 def _alert_line(event: dict) -> str:
     if event["type"] == "budget_exceeded":
         detail = (f"{_inline_text(event['user'])} 用量超额"
@@ -115,7 +122,7 @@ def _alert_line(event: dict) -> str:
         detail = f"{_inline_text(event['model'])} 连续超时"
     else:
         detail = f"{_inline_text(event['model'])} 恢复"
-    requests = ", ".join(_inline_text(request_id) for request_id in event["request_ids"])
+    requests = ", ".join(_request_id_text(request_id) for request_id in event["request_ids"])
     return f"- {_inline_text(event['ts'])} {detail}，请求 {requests}"
 
 
