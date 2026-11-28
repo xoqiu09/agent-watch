@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, localcontext
+from hashlib import sha256
 from pathlib import Path
 from typing import TypedDict
 
@@ -39,6 +40,8 @@ class Log:
     records: list[Record]
     bad_lines: list[tuple[int, str]]
     line_count: int
+    prefix_digest: str | None = None
+    content_digest: str | None = None
 
     def index_requests(self) -> dict[str, Record]:
         by_id: dict[str, Record] = {}
@@ -165,10 +168,14 @@ def _parse(raw: str, line_number: int) -> Record:
 
 def read_log(path: Path, *, defer_partial_tail: bool = False, processed_lines: int = 0) -> Log:
     log = Log(records=[], bad_lines=[], line_count=0)
+    digest = sha256() if defer_partial_tail else None
+    if digest is not None and processed_lines == 0:
+        log.prefix_digest = digest.hexdigest()
     with path.open("rb") as source:
         for line_number, line in enumerate(source, start=1):
+            content = line.removesuffix(b"\n").removesuffix(b"\r")
             try:
-                raw = line.decode("utf-8").removesuffix("\n").removesuffix("\r")
+                raw = content.decode("utf-8")
                 log.records.append(_parse(raw, line_number))
             except (ValueError, RecursionError) as exc:
                 # An older version could have already counted this complete row.
@@ -178,4 +185,12 @@ def read_log(path: Path, *, defer_partial_tail: bool = False, processed_lines: i
                     break
                 log.bad_lines.append((line_number, str(exc)))
             log.line_count = line_number
+            if digest is not None:
+                # Adding a terminator to the last processed row preserves its content.
+                digest.update(content)
+                digest.update(b"\n")
+                if line_number == processed_lines:
+                    log.prefix_digest = digest.hexdigest()
+    if digest is not None:
+        log.content_digest = digest.hexdigest()
     return log
