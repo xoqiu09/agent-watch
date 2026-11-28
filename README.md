@@ -8,7 +8,7 @@
 
 ## 怎么验证的
 
-本地运行 `python3 -m unittest -v`，**全量 79 项通过**。测试确认连续超时达到门槛才告警，告警后首次成功会记录恢复，每位用户每天首次超过 token 预算时提醒一次。开启单次慢调用告警后，只有成功且耗时严格超过门槛的调用才会触发。沿用同一状态文件重跑同一份日志，不会重复告警。测试也核对了请求追溯、费用计算和日报比较。
+本地运行 `python3 -m unittest -v`，**全量 84 项通过**。测试确认连续超时达到门槛才告警，告警后首次成功会记录恢复，每位用户每天首次超过 token 预算时提醒一次。开启单次慢调用告警后，只有成功且耗时严格超过门槛的调用才会触发。沿用同一状态文件重跑同一份日志，不会重复告警。测试也核对了请求追溯、费用计算和日报比较。
 
 在临时副本里故意让成功后超时计数不清零、超额反复告警、日报刚到门槛就标记变慢。对应测试都失败，恢复规则后通过。
 把单次慢调用规则改为达到门槛就告警时，边界测试失败，恢复规则后通过。
@@ -32,7 +32,7 @@ agent-watch is a Python CLI for support teams investigating slow AI responses an
 It summarizes usage, latency, and estimated costs and compares them in a daily report.\
 It flags repeated timeouts, recoveries, and token budget overruns and traces alerts to the original calls.\
 Set the optional `slow_call_ms` to a positive integer to make `alerts` emit a `slow_call` event for each successful call whose latency strictly exceeds that threshold in milliseconds. The event includes the timestamp, model, request ID, and latency.\
-All 79 tests passed locally, and deliberate rule changes made the relevant tests fail.\
+All 84 tests passed locally, and deliberate rule changes made the relevant tests fail.\
 The demo uses fictional data, models, and users. The owner set requirements and acceptance criteria and directed AI coding tools to build it.
 
 ## 运行演示

@@ -206,11 +206,13 @@ class TestM1(unittest.TestCase):
                 self.assertFalse(self.state.exists())
 
     def test_concurrent_alerts_do_not_rewind_state_or_repeat_events(self):
+        self._assert_concurrent_alerts(self.state)
+
+    def _assert_concurrent_alerts(self, second_state):
         import fcntl
 
         self.write_rows(call(1, "timeout", tokens_in=11))
-        args = ["alerts", "--log", str(self.log), "--config", str(self.config),
-                "--state", str(self.state)]
+        args = ["alerts", "--log", str(self.log), "--config", str(self.config), "--state"]
         pause_before_save = """
 import sys
 from contextlib import contextmanager
@@ -232,7 +234,7 @@ raise SystemExit(cli.main())
         first_output = None
         second_stdout = StringIO()
         with subprocess.Popen(
-            [sys.executable, "-c", pause_before_save, *args],
+            [sys.executable, "-c", pause_before_save, *args, str(self.state)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         ) as first:
             try:
@@ -251,12 +253,11 @@ raise SystemExit(cli.main())
                 # Let the first run save when the second would have to wait for it.
                 with (
                     patch.object(fcntl, "flock", finish_first_if_blocked),
-                    patch("sys.argv", ["agentwatch", *args]),
+                    patch("sys.argv", ["agentwatch", *args, str(second_state)]),
                     redirect_stdout(second_stdout),
                 ):
                     self.assertEqual(main(), 0)
-                if first_output is None:
-                    first_output = first.communicate(timeout=10)
+                self.assertIsNotNone(first_output, "second run did not contend for the state lock")
                 self.assertEqual(first.returncode, 0, first_output[1])
             finally:
                 first.kill()
@@ -290,6 +291,61 @@ raise SystemExit(cli.main())
         self.assertEqual(self.config.read_bytes(), original_config)
         self.assertTrue(lock_path.samefile(self.config))
         self.assertFalse(self.state.exists())
+
+    def test_alerts_cannot_use_an_input_as_state(self):
+        self.write_rows({**call(1), "processed_lines": 0})
+        original_log = self.log.read_bytes()
+        config = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**config, "processed_lines": 0}))
+        original_config = self.config.read_bytes()
+
+        for source, option in ((self.log, "--log"), (self.config, "--config")):
+            with self.subTest(option=option):
+                result = self.cli("alerts", "--config", self.config, "--state", source,
+                                  exit_code=1)
+                self.assertIn(f"--state must differ from {option}", result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.log.read_bytes(), original_log)
+                self.assertEqual(self.config.read_bytes(), original_config)
+                self.assertEqual(self.cli("trace", "r1").stdout.encode(), original_log)
+
+    def test_alerts_share_progress_and_lock_through_a_state_symlink(self):
+        alias = self.directory / "state-link.json"
+        alias.symlink_to(self.state.name)
+
+        self._assert_concurrent_alerts(alias)
+
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(json.loads(alias.read_text())["processed_lines"], 2)
+        self.assertFalse(alias.with_name(alias.name + ".lock").exists())
+
+    def test_alerts_reject_invalid_state_path_components(self):
+        self.write_rows(call(1, tokens_in=11))
+        blocker = self.directory / "not-a-directory"
+        blocker.touch()
+        invalid_path = blocker / ".." / self.state.name
+        alias = self.directory / "state-link.json"
+        alias.symlink_to(Path("missing-directory") / ".." / self.state.name)
+        previous_state = b'{"processed_lines": 0}\n'
+
+        for path, missing_error, existing_error in (
+            (invalid_path, "Not a directory", "Not a directory"),
+            (alias, "No such file or directory", "No such file or directory"),
+            (f"{self.state}/", "No such file or directory", "Not a directory"),
+            (f"{self.state}/.", "No such file or directory", "Not a directory"),
+        ):
+            for before, message in ((None, missing_error), (previous_state, existing_error)):
+                with self.subTest(path=path, state_exists=before is not None):
+                    if before is None:
+                        self.state.unlink(missing_ok=True)
+                    else:
+                        self.state.write_bytes(before)
+                    result = self.cli("alerts", "--config", self.config, "--state", path,
+                                      exit_code=1)
+                    self.assertIn(message, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    after = self.state.read_bytes() if self.state.exists() else None
+                    self.assertEqual(after, before)
 
     def test_alerts_explains_when_unix_file_locking_is_unavailable(self):
         self.write_rows(call(1))
@@ -579,9 +635,16 @@ raise SystemExit(cli.main())
                 self.assertIn("log does not match saved alert progress", rejected.stderr)
                 self.assertEqual(self.state.read_bytes(), saved)
 
-        self.state.write_bytes(saved)
         self.log = original_log
         self.write_rows(call(3, "timeout"), append=True)
+        self.state.write_bytes(saved)
+        rejected = self.alerts(exit_code=1)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("cannot verify timeout_streak", rejected.stderr)
+        self.assertEqual(self.state.read_bytes(), saved)
+
+        # A known threshold allows an otherwise matching state to gain its first log digest.
+        self.state.write_text(json.dumps({**json.loads(saved), "timeout_streak": 2}))
         self.assertEqual(event_ids(events_from(self.alerts().stdout)), [
             ("timeout_streak", ["r1", "r3"]),
         ])
@@ -667,6 +730,39 @@ raise SystemExit(cli.main())
         self.assertEqual(event_ids(events), [("timeout_streak", ["r1", "r4", "r5"])])
         self.assertEqual(events[0]["model"], "model-b")
 
+    def test_alerts_reject_a_changed_timeout_threshold_without_advancing(self):
+        config = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**config, "timeout_streak": 3}))
+        self.write_rows(call(1, "timeout"), call(2, "timeout"))
+        self.assertEqual(self.alerts().stdout, "")
+        previous_state = self.state.read_bytes()
+
+        self.config.write_text(json.dumps({**config, "timeout_streak": 2}))
+        self.write_rows(call(3), append=True)
+        result = self.alerts(exit_code=1)
+
+        self.assertEqual(result.stdout, "")
+        self.assertIn("timeout_streak changed", result.stderr)
+        self.assertEqual(self.state.read_bytes(), previous_state)
+
+    def test_alerts_reject_legacy_progress_with_an_unknown_timeout_threshold(self):
+        config = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**config, "timeout_streak": 3}))
+        self.write_rows(call(1, "timeout"), call(2, "timeout"))
+        self.assertEqual(self.alerts().stdout, "")
+        legacy_state = json.loads(self.state.read_text())
+        legacy_state.pop("timeout_streak")
+        previous_state = json.dumps(legacy_state).encode()
+        self.state.write_bytes(previous_state)
+
+        self.config.write_text(json.dumps({**config, "timeout_streak": 2}))
+        self.write_rows(call(3), append=True)
+        result = self.alerts(exit_code=1)
+
+        self.assertEqual(result.stdout, "")
+        self.assertIn("cannot verify timeout_streak", result.stderr)
+        self.assertEqual(self.state.read_bytes(), previous_state)
+
     def test_16_budget_uses_each_timestamp_local_date(self):
         self.write_rows(
             call(1, ts="2026-11-27T23:59:58-05:00", tokens_in=10),
@@ -701,6 +797,7 @@ raise SystemExit(cli.main())
         self.write_rows(first, call(2, "timeout", user=first["user"], tokens_out=1))
         self.state.write_text(json.dumps({
             "processed_lines": 1,
+            "timeout_streak": 2,
             "timeouts": {"model-a": [first["request_id"]]},
             "daily_usage": {first["user"]: {"2026-11-27": {"tokens": 101, "alerted": True}}},
         }))
@@ -731,6 +828,7 @@ raise SystemExit(cli.main())
                                 call(3, "timeout", tokens_in=3))
                 self.state.write_text(json.dumps({
                     "processed_lines": 2,
+                    "timeout_streak": 2,
                     "last_timestamp": rejected["ts"],
                     "exact_timestamps": True,
                     "timeouts": {model_key: [2]} if status == "timeout" else {},
@@ -940,6 +1038,7 @@ raise SystemExit(cli.main())
                     self.assertEqual(event_ids(events_from(result.stdout)), [
                         ("timeout_streak", ["r1", "r3"]),
                     ])
+                    self.assertEqual(json.loads(self.state.read_text())["timeout_streak"], 2)
                     self.assertEqual(self.alerts().stdout, "")
 
     def test_alerts_rebuild_legacy_progress_with_invalid_offset_minutes(self):
@@ -964,6 +1063,7 @@ raise SystemExit(cli.main())
                     usage[bob] = {day: {"tokens": 101, "alerted": True}}
                 self.state.write_text(json.dumps({
                     "processed_lines": len(history),
+                    "timeout_streak": 2,
                     "last_timestamp": history[-1]["ts"],
                     "exact_timestamps": True,
                     "timeouts": timeouts,
@@ -1005,9 +1105,10 @@ raise SystemExit(cli.main())
                 if last_line == 3:
                     history.append(call(3, "timeout"))
                 self.write_rows(*history)
-                # State emitted by 87a0448, which accepted +08:60 as +09:00.
+                # Use the old parser's progress with the threshold known for this replay test.
                 self.state.write_text(json.dumps({
                     "processed_lines": last_line,
+                    "timeout_streak": 2,
                     "last_timestamp": history[-1]["ts"],
                     "exact_timestamps": True,
                     "log_validation_version": 1,
