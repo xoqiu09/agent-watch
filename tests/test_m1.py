@@ -529,6 +529,89 @@ raise SystemExit(cli.main())
         restored = self.alerts()
         self.assertEqual((restored.stdout, restored.stderr), ("", ""))
 
+    def test_alerts_reject_progress_from_another_log(self):
+        original_log = self.log
+        original_log.write_text(json.dumps(call(1, "timeout")), encoding="utf-8")
+        self.assertEqual(self.alerts().stdout, "")
+        saved = self.state.read_bytes()
+
+        self.log = self.directory / "other.jsonl"
+        self.write_rows(call(2), call(3, "timeout"))
+        fresh = self.cli("alerts", "--config", self.config, "--state",
+                         self.directory / "fresh.json")
+        self.assertEqual(fresh.stdout, "")
+        rejected = self.alerts(exit_code=1)
+        self.assertEqual(rejected.stdout, "")
+        self.assertIn("log does not match saved alert progress", rejected.stderr)
+        self.assertEqual(self.state.read_bytes(), saved)
+
+        self.log = original_log
+        # The previously valid last row did not end in a newline.
+        self.write_rows("", call(3, "timeout"), append=True)
+        self.assertEqual(event_ids(events_from(self.alerts().stdout)), [
+            ("timeout_streak", ["r1", "r3"]),
+        ])
+
+    def test_alerts_check_legacy_progress_before_saving_log_digest(self):
+        original_log = self.log
+        first = call(1, "timeout")
+        self.write_rows(first)
+        # State emitted by 4670b82 before log digests were stored.
+        saved = json.dumps({
+            "processed_lines": 1,
+            "last_timestamp": first["ts"],
+            "exact_timestamps": True,
+            "log_validation_version": 1,
+            "offset_minutes_validated": True,
+            "timeouts": {sha256(b"model-a").hexdigest(): [1]},
+            "daily_usage": {sha256(b"alice").hexdigest(): {
+                "2026-11-27": {"tokens": 0, "alerted": False},
+            }},
+        }).encode()
+
+        self.log = self.directory / "other.jsonl"
+        for other in (call(2), call(2, "timeout", "model-b"), "not json"):
+            with self.subTest(first_row=other):
+                self.state.write_bytes(saved)
+                self.write_rows(other, call(3, "timeout"))
+                rejected = self.alerts(exit_code=1)
+                self.assertEqual(rejected.stdout, "")
+                self.assertIn("log does not match saved alert progress", rejected.stderr)
+                self.assertEqual(self.state.read_bytes(), saved)
+
+        self.state.write_bytes(saved)
+        self.log = original_log
+        self.write_rows(call(3, "timeout"), append=True)
+        self.assertEqual(event_ids(events_from(self.alerts().stdout)), [
+            ("timeout_streak", ["r1", "r3"]),
+        ])
+        self.assertIsNotNone(json.loads(self.state.read_text())["log_digest"])
+
+    def test_alerts_reject_duplicate_user_budgets_in_either_order(self):
+        self.write_rows(call(1))
+        self.assertEqual(self.alerts().stdout, "")
+        saved = self.state.read_bytes()
+        self.write_rows(call(2, user="demo", tokens_in=11), append=True)
+
+        for first, second in ((10, 100), (100, 10)):
+            duplicate = f'"daily_token_budget": {{"demo": {first}, "demo": {second}}}'
+            for location, budgets in (
+                ("same section", duplicate),
+                ("separate sections", f'"daily_token_budget": {{"demo": {first}}}, '
+                                      f'"daily_token_budget": {{"demo": {second}}}'),
+                ("overwritten section", duplicate + ', "daily_token_budget": {"alice": 10}'),
+            ):
+                with self.subTest(location=location, first=first, second=second):
+                    self.state.write_bytes(saved)
+                    self.config.write_text(
+                        f'{{"timeout_streak": 2, {budgets}, "default_daily_token_budget": 100}}',
+                        encoding="utf-8",
+                    )
+                    rejected = self.alerts(exit_code=1)
+                    self.assertEqual(rejected.stdout, "")
+                    self.assertIn("duplicate daily_token_budget user 'demo'", rejected.stderr)
+                    self.assertEqual(self.state.read_bytes(), saved)
+
     def test_13_duplicate_request_ids_report_conflicting_lines(self):
         self.write_rows(call(1), "bad")
         self.assertEqual(self.alerts().stdout, "")
@@ -904,6 +987,39 @@ raise SystemExit(cli.main())
                     ("timeout_streak", ["r3", "r4"]),
                     ("budget_exceeded", ["r4"]),
                 ])
+                self.assertEqual(self.alerts().stdout, "")
+
+    def test_alerts_upgrade_keeps_real_notices_without_inventing_recovery(self):
+        day = "2026-11-27"
+        invalid_ts = f"{day}T11:00:02+08:60"
+        user_key = sha256(b"alice").hexdigest()
+        model_key = sha256(b"model-a").hexdigest()
+        for status, last_line, old_streak, expected in (
+            ("ok", 3, [3], []),
+            ("timeout", 2, [1, 2], [("recovered", ["r4"])]),
+        ):
+            with self.subTest(invalid_status=status):
+                first = call(1, "timeout", tokens_in=8 if status == "ok" else 3)
+                invalid = call(2, status, ts=invalid_ts, tokens_in=11 - first["tokens_in"])
+                history = [first, invalid]
+                if last_line == 3:
+                    history.append(call(3, "timeout"))
+                self.write_rows(*history)
+                # State emitted by 87a0448, which accepted +08:60 as +09:00.
+                self.state.write_text(json.dumps({
+                    "processed_lines": last_line,
+                    "last_timestamp": history[-1]["ts"],
+                    "exact_timestamps": True,
+                    "log_validation_version": 1,
+                    "timeouts": {model_key: old_streak},
+                    "daily_usage": {user_key: {day: {"tokens": 11, "alerted": True}}},
+                }))
+                self.write_rows(call(4, tokens_in=11 - first["tokens_in"]), append=True)
+                result = self.alerts()
+                self.assertEqual(event_ids(events_from(result.stdout)), expected)
+                saved = json.loads(self.state.read_text())
+                self.assertEqual(saved["daily_usage"][user_key][day],
+                                 {"tokens": 11, "alerted": True})
                 self.assertEqual(self.alerts().stdout, "")
 
     def test_26_alerts_sort_by_utc_with_fractional_offsets(self):

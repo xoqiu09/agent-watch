@@ -220,11 +220,15 @@ def main() -> int:
         elif args.command == "alerts":
             if log.line_count < state["processed_lines"]:
                 raise ValueError("log is shorter than saved alert progress")
+            saved_digest = state.get("log_digest")
+            if saved_digest is not None and saved_digest != log.prefix_digest:
+                raise ValueError("log does not match saved alert progress")
             log.index_requests()
             config = read_config(args.config)
             state = upgrade_state(state, log.records, config)
             events = process_records(log.records, config, state, slow_call_ms=config["slow_call_ms"])
             state["processed_lines"] = log.line_count
+            state["log_digest"] = log.content_digest
             with atomic_output(args.state) as target:
                 json.dump(state, target)
                 # Closing surfaces buffered write errors before emitting any alerts.
