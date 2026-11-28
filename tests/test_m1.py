@@ -573,6 +573,64 @@ raise SystemExit(cli.main())
         for private in (first["user"], first["request_id"]):
             self.assertNotIn(private, self.state.read_text())
 
+    def test_alerts_rebuild_state_after_log_validation_changes(self):
+        user_key = sha256(b"alice").hexdigest()
+        model_key = sha256(b"model-a").hexdigest()
+        for status, field in (("timeout", "tokens_in"), ("timeout", "request_id"),
+                              ("error", "tokens_in")):
+            with self.subTest(status=status, field=field):
+                rejected = call(2, status, tokens_in=6)
+                if field == "request_id":
+                    bad_row = json.dumps({**rejected, "request_id": "\ud83d"})
+                else:
+                    bad_row = json.dumps(rejected).replace('"tokens_in": 6',
+                                                           '"tokens_in": 12, "tokens_in": 6')
+                self.write_rows(call(1, "error", tokens_in=2), bad_row,
+                                call(3, "timeout", tokens_in=3))
+                self.state.write_text(json.dumps({
+                    "processed_lines": 2,
+                    "last_timestamp": rejected["ts"],
+                    "exact_timestamps": True,
+                    "timeouts": {model_key: [2]} if status == "timeout" else {},
+                    "daily_usage": {user_key: {"2026-11-27": {"tokens": 8, "alerted": False}}},
+                }), encoding="utf-8")
+
+                result = self.alerts()
+                self.assertEqual((result.stdout, result.stderr), ("", ""))
+                upgraded = json.loads(self.state.read_text())
+                self.assertEqual(upgraded["processed_lines"], 3)
+                self.assertEqual(upgraded["log_validation_version"], 1)
+
+                self.write_rows(call(4, "timeout", tokens_in=6), append=True)
+                events = events_from(self.alerts().stdout)
+                self.assertEqual(event_ids(events), [
+                    ("timeout_streak", ["r3", "r4"]), ("budget_exceeded", ["r4"]),
+                ])
+                self.assertEqual(events[1]["tokens"], 11)
+                self.assertEqual(self.alerts().stdout, "")
+
+    def test_alerts_upgrade_keeps_processed_bad_tail_without_newline(self):
+        rejected = call(1, "error")
+        bad_row = json.dumps({**rejected, "request_id": "\ud83d"})
+        self.log.write_text(bad_row, encoding="utf-8")
+        self.state.write_text(json.dumps({
+            "processed_lines": 1,
+            "last_timestamp": rejected["ts"],
+            "exact_timestamps": True,
+            "timeouts": {},
+            "daily_usage": {sha256(b"alice").hexdigest(): {
+                "2026-11-27": {"tokens": 0, "alerted": False},
+            }},
+        }), encoding="utf-8")
+
+        for _ in range(2):
+            result = self.alerts()
+            self.assertEqual((result.stdout, result.stderr), ("", ""))
+            self.assertEqual(json.loads(self.state.read_text())["processed_lines"], 1)
+
+        self.log.write_text(bad_row[:-1], encoding="utf-8")
+        self.assertIn("log is shorter than saved alert progress", self.alerts(exit_code=1).stderr)
+
     def test_20_alerts_keep_submicrosecond_order_and_progress(self):
         with self.subTest("sort within a microsecond"):
             self.write_rows(

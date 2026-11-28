@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import TypedDict
 
 
+class _LogValidationError(ValueError):
+    """A complete JSON row rejected by the newer field checks."""
+
+
 class Call(TypedDict):
     ts: str
     request_id: str
@@ -102,11 +106,18 @@ def parse_timestamp(source: str) -> tuple[datetime, Decimal]:
 
 def _parse(raw: str, line_number: int) -> Record:
     try:
-        data = json.loads(raw, parse_float=Decimal, parse_constant=_reject_constant)
+        # Object pairs stay in a tuple, distinct from JSON arrays.
+        pairs = json.loads(raw, parse_float=Decimal, parse_constant=_reject_constant,
+                           object_pairs_hook=tuple)
     except InvalidOperation as exc:
         raise ValueError("invalid JSON number") from exc
-    if not isinstance(data, dict):
+    if not isinstance(pairs, tuple):
         raise ValueError("expected a JSON object")
+    data = {}
+    for field, value in pairs:
+        if field in data and field in Call.__annotations__:
+            raise _LogValidationError(f"duplicate field: {field}")
+        data[field] = value
     for field in Call.__annotations__:
         if field not in data:
             raise ValueError(f"missing field: {field}")
@@ -114,6 +125,11 @@ def _parse(raw: str, line_number: int) -> Record:
     for field in ("ts", "request_id", "user", "model"):
         if not isinstance(data[field], str) or not data[field].strip():
             raise ValueError(f"{field} must be a non-empty string")
+    for field in ("request_id", "user", "model"):
+        try:
+            data[field].encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise _LogValidationError(f"{field} must be valid UTF-8") from exc
     if data["status"] not in ("ok", "timeout", "error"):
         raise ValueError("unknown status")
     for field in ("tokens_in", "tokens_out"):
@@ -140,7 +156,7 @@ def _parse(raw: str, line_number: int) -> Record:
     return Record(call, timestamp, utc_seconds, raw, line_number)
 
 
-def read_log(path: Path, *, defer_partial_tail: bool = False) -> Log:
+def read_log(path: Path, *, defer_partial_tail: bool = False, processed_lines: int = 0) -> Log:
     log = Log(records=[], bad_lines=[], line_count=0)
     with path.open("rb") as source:
         for line_number, line in enumerate(source, start=1):
@@ -148,7 +164,10 @@ def read_log(path: Path, *, defer_partial_tail: bool = False) -> Log:
                 raw = line.decode("utf-8").removesuffix("\n").removesuffix("\r")
                 log.records.append(_parse(raw, line_number))
             except (ValueError, RecursionError) as exc:
-                if defer_partial_tail and not line.endswith(b"\n"):
+                # An older version could have already counted this complete row.
+                saved_invalid_row = (line_number <= processed_lines
+                                     and isinstance(exc, _LogValidationError))
+                if defer_partial_tail and not line.endswith(b"\n") and not saved_invalid_row:
                     break
                 log.bad_lines.append((line_number, str(exc)))
             log.line_count = line_number

@@ -119,16 +119,20 @@ def _alert_line(event: dict) -> str:
     return f"- {_inline_text(event['ts'])} {detail}，请求 {requests}"
 
 
-def write_report(records: list[Record], day: date, config: Config, output: Path) -> None:
+def write_report(
+    records: list[Record], day: date, config: Config, output: Path, *, bad_line_count: int = 0,
+) -> None:
     report, todays_records = daily_comparison(records, day, config["prices"] or {})
     alerts = process_records(todays_records, config, new_state())
     comparison = report["comparison"]
-    lines = [
-        f"# 调用日报 {report['date']}", "",
+    lines = [f"# 调用日报 {report['date']}", ""]
+    if bad_line_count:
+        lines.extend([f"本次读取跳过 {bad_line_count} 行，指标仅按有效记录计算", ""])
+    lines.extend([
         "| 日期 | 调用数 | 成功率 | p95 | 输入 token | 输出 token | 费用 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         _row(report["date"], report["metrics"]),
-    ]
+    ])
     if comparison["previous"] is not None:
         lines.append(_row(comparison["previous_date"], comparison["previous"]))
     lines.extend(["", "## 与前一天比较", "",
