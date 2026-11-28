@@ -69,6 +69,26 @@ class TestM2(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("duplicate request_id 'r1' on lines 1 and 2", result.stderr)
 
+    def test_summary_rejects_negative_prices_and_accepts_zero(self):
+        self.write_rows(call(1, tokens_in=1000, tokens_out=1000))
+        zero_prices = {"in_per_1k": 0, "out_per_1k": 0}
+        self.set_prices({"model-a": zero_prices})
+        summary = self.summary()
+        self.assertEqual(summary["by_user"]["alice"]["cost"], 0)
+        self.assertEqual(summary["by_model"]["model-a"]["cost"], 0)
+
+        for field, price in (("in_per_1k", -1), ("out_per_1k", -0.5)):
+            with self.subTest(field=field):
+                self.set_prices({"model-a": {**zero_prices, field: price}})
+                result = subprocess.run(
+                    [sys.executable, "-m", "agentwatch", "summary",
+                     "--log", str(self.log), "--config", str(self.config)],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(f"prices['model-a'].{field} must be non-negative", result.stderr)
+
     def test_cost_is_grouped_and_rounded_only_after_adding_calls(self):
         self.set_prices({
             "model-a": {"in_per_1k": 0.04, "out_per_1k": 0.03},
